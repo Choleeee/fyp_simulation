@@ -26,9 +26,10 @@ SUCCESS_SPEED_M_S = 0.3
 HIT_RADIUS_M = POLE_RADIUS_M + 0.15
 EPISODE_TIMEOUT_S = 40.0
 
-# Depth camera sized for training. Intrinsics use the D435i depth field of view.
-CAMERA_WIDTH = 160
-CAMERA_HEIGHT = 120
+# The column is 76 mm wide. At 160x120 it is about two pixels across at 4 m,
+# and block averaging then mixes it into the background. 640x480 keeps it visible.
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
 CAMERA_HFOV_DEG = 87.0
 CAMERA_VFOV_DEG = 58.0
 DEPTH_MIN_M = 0.2
@@ -61,19 +62,25 @@ def wrap_angle(angle):
 
 
 def downsample_depth(depth):
-    """Convert a depth image in metres to the fixed observation size."""
+    """Convert a depth image in metres to the fixed observation size.
+
+    Each block keeps the nearest return. Averaging would hide the column,
+    which is only a few pixels wide. Missing returns are treated as far.
+    """
     depth = np.asarray(depth, dtype=np.float32)
     if depth.ndim == 3:
         depth = depth[..., 0]
-    depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+    depth = np.nan_to_num(depth, nan=DEPTH_MAX_M, posinf=DEPTH_MAX_M, neginf=DEPTH_MAX_M)
     depth = np.clip(depth, 0.0, DEPTH_MAX_M)
+    depth[depth < DEPTH_MIN_M] = DEPTH_MAX_M
 
     src_h, src_w = depth.shape
     ys = np.linspace(0, src_h, OBS_HEIGHT + 1).astype(int)
     xs = np.linspace(0, src_w, OBS_WIDTH + 1).astype(int)
-    out = np.zeros((OBS_HEIGHT, OBS_WIDTH), dtype=np.float32)
+    out = np.full((OBS_HEIGHT, OBS_WIDTH), DEPTH_MAX_M, dtype=np.float32)
     for row in range(OBS_HEIGHT):
         for col in range(OBS_WIDTH):
             block = depth[ys[row] : ys[row + 1], xs[col] : xs[col + 1]]
-            out[row, col] = 0.0 if block.size == 0 else float(block.mean())
+            if block.size:
+                out[row, col] = float(block.min())
     return out / DEPTH_MAX_M

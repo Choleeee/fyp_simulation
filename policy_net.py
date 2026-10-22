@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from task import ACTION_DIM, OBS_HEIGHT, OBS_WIDTH, STATE_DIM
+from task import ACTION_DIM, OBS_HEIGHT, OBS_WIDTH, STATE_DIM, V_MAX_M_S, YAW_RATE_MAX_RAD_S
 
 
 class ApproachPolicy(nn.Module):
@@ -44,4 +44,11 @@ def predict(policy, depth_obs, state, device="cpu"):
         depth = torch.as_tensor(depth_obs, dtype=torch.float32, device=device).view(1, 1, OBS_HEIGHT, OBS_WIDTH)
         state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).view(1, STATE_DIM)
         action = policy(depth, state_tensor).cpu().numpy()[0]
-    return np.asarray(action, dtype=np.float32)
+    action = np.asarray(action, dtype=np.float32)
+    horizontal = float(np.hypot(action[0], action[1]))
+    if horizontal > V_MAX_M_S:
+        action[0] *= V_MAX_M_S / horizontal
+        action[1] *= V_MAX_M_S / horizontal
+    action[2] = np.clip(action[2], -V_MAX_M_S, V_MAX_M_S)
+    action[3] = np.clip(action[3], -YAW_RATE_MAX_RAD_S, YAW_RATE_MAX_RAD_S)
+    return action

@@ -121,7 +121,7 @@ class ApproachSession:
                 self.phase_started = now
             elif now - self.phase_started > 12.0:
                 print(f"Episode {self.episode + 1} did not arm")
-                self._finish_episode(False)
+                self._finish_episode(False, "no arm")
             return
 
         if self.phase == "takeoff":
@@ -137,7 +137,7 @@ class ApproachSession:
                 print(f"Episode {self.episode + 1}: pole at x={self.pole_xy[0]:.2f} y={self.pole_xy[1]:.2f}")
             elif now - self.phase_started > 20.0:
                 print(f"Episode {self.episode + 1} did not reach approach altitude")
-                self._finish_episode(False)
+                self._finish_episode(False, "no climb")
             return
 
         if self.phase == "fly":
@@ -146,9 +146,11 @@ class ApproachSession:
             speed = float(np.linalg.norm(self.vehicle.state.linear_velocity))
             elapsed = now - self.phase_started
             if expert.reached_staging(position, self.pole_xy, speed):
-                self._finish_episode(True)
-            elif expert.hit_pole(position, self.pole_xy) or elapsed > EPISODE_TIMEOUT_S:
-                self._finish_episode(False)
+                self._finish_episode(True, "success")
+            elif expert.hit_pole(position, self.pole_xy):
+                self._finish_episode(False, "hit")
+            elif elapsed > EPISODE_TIMEOUT_S:
+                self._finish_episode(False, "timeout")
             return
 
         if self.phase == "land":
@@ -213,19 +215,18 @@ class ApproachSession:
         label = executed_action if self.mode == "rollout" else expert_action
         self.samples.append((observation, state, label))
 
-    def _finish_episode(self, success):
-        self._save(success)
+    def _finish_episode(self, success, reason):
+        self._save(success, reason)
         self.episode += 1
         # Descend at the staging point. The landing is not part of the demonstration.
         self._set_land_mode()
         self.phase = "land"
         self.phase_started = time.monotonic()
 
-    def _save(self, success):
-        outcome = "success" if success else "failure"
+    def _save(self, success, reason):
         if not self.samples:
             print(
-                f"Episode {self.episode + 1} recorded no camera frames ({outcome}, "
+                f"Episode {self.episode + 1} recorded no camera frames ({reason}, "
                 f"{self.missed_frames} reads empty)"
             )
             return
@@ -239,9 +240,10 @@ class ApproachSession:
             state=state.astype(np.float32),
             action=action.astype(np.float32),
             success=np.array([success]),
+            reason=np.array(reason),
         )
         missed = f", camera missed {self.missed_frames} steps" if self.missed_frames else ""
-        print(f"Saved {len(self.samples)} samples to {path} ({outcome}{missed})")
+        print(f"Saved {len(self.samples)} samples to {path} ({reason}{missed})")
 
     def _send(self, flu_action):
         # PX4 body frame is forward-right-down, and its yaw rate is clockwise.
