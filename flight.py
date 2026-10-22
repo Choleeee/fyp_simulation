@@ -1,7 +1,10 @@
 """Run privileged-expert or learned-policy approaches inside iris_pole.py.
 
-The vehicle is commanded in PX4 offboard mode. Each episode places the pole
-3–5 m from the Iris. Samples are written under simulation/data/.
+The vehicle is commanded in PX4 offboard mode. It climbs at the start
+without recording, then the approach is recorded until the staging point,
+one metre short of the pole. The vehicle lands on that spot. The next pole
+is placed 3–5 m from the landing, along the direction from that spot to the
+pole just reached.
 """
 
 import os
@@ -73,7 +76,6 @@ class ApproachSession:
         self.missed_frames = 0
         self.done = False
         self._status_time = 0.0
-        self.home_xy = None
 
         if mode in ("rollout", "dagger"):
             if not os.path.isfile(policy_path):
@@ -115,13 +117,26 @@ class ApproachSession:
             self._send(action)
             self._arm(force=now - self.phase_started > 3.0)
             if self._armed():
+                self.phase = "takeoff"
+                self.phase_started = now
+            elif now - self.phase_started > 12.0:
+                print(f"Episode {self.episode + 1} did not arm")
+                self._finish_episode(False)
+            return
+
+        if self.phase == "takeoff":
+            # Climb at the landing spot. The approach recording starts at altitude.
+            climb = float(np.clip(0.8 * (TARGET_ALTITUDE_M - position[2]), -0.5, 0.5))
+            self._send(np.array([0.0, 0.0, climb, 0.0], dtype=np.float32))
+            vertical_speed = abs(float(self.vehicle.state.linear_velocity[2]))
+            if abs(position[2] - TARGET_ALTITUDE_M) < 0.3 and vertical_speed < 0.3:
                 self.samples = []
                 self.missed_frames = 0
                 self.phase = "fly"
                 self.phase_started = now
                 print(f"Episode {self.episode + 1}: pole at x={self.pole_xy[0]:.2f} y={self.pole_xy[1]:.2f}")
-            elif now - self.phase_started > 12.0:
-                print(f"Episode {self.episode + 1} did not arm")
+            elif now - self.phase_started > 20.0:
+                print(f"Episode {self.episode + 1} did not reach approach altitude")
                 self._finish_episode(False)
             return
 
@@ -134,16 +149,6 @@ class ApproachSession:
                 self._finish_episode(True)
             elif expert.hit_pole(position, self.pole_xy) or elapsed > EPISODE_TIMEOUT_S:
                 self._finish_episode(False)
-            return
-
-        if self.phase == "return":
-            back = expert.fly_to(position, yaw, self.home_xy, TARGET_ALTITUDE_M)
-            self._send(back)
-            home_distance = float(np.linalg.norm(position[:2] - self.home_xy))
-            if home_distance < 0.4 or now - self.phase_started > EPISODE_TIMEOUT_S:
-                self._set_land_mode()
-                self.phase = "land"
-                self.phase_started = now
             return
 
         if self.phase == "land":
@@ -178,10 +183,8 @@ class ApproachSession:
             self._disarm_and_stop()
             return
         position = np.asarray(self.vehicle.state.position, dtype=np.float64)
-        if self.home_xy is None:
-            self.home_xy = position[:2].copy()
-        yaw = float(np.random.default_rng().uniform(-np.pi, np.pi))
-        self.pole_xy = _random_pole(self.home_xy, yaw, np.random.default_rng())
+        yaw = _yaw(self.vehicle.state.attitude)
+        self.pole_xy = _next_pole(position[:2], self.pole_xy, yaw, np.random.default_rng())
         self.pole.set_world_pose(position=np.array([self.pole_xy[0], self.pole_xy[1], POLE_HEIGHT_M / 2.0]))
         self.phase = "stream"
         self.phase_started = time.monotonic()
@@ -213,7 +216,9 @@ class ApproachSession:
     def _finish_episode(self, success):
         self._save(success)
         self.episode += 1
-        self.phase = "return"
+        # Descend at the staging point. The landing is not part of the demonstration.
+        self._set_land_mode()
+        self.phase = "land"
         self.phase_started = time.monotonic()
 
     def _save(self, success):
@@ -338,3 +343,14 @@ def _random_pole(vehicle_xy, yaw, rng):
     forward = np.array([np.cos(yaw), np.sin(yaw)])
     left = np.array([-np.sin(yaw), np.cos(yaw)])
     return np.asarray(vehicle_xy, dtype=np.float64) + distance * forward + lateral * left
+
+
+def _next_pole(vehicle_xy, pole_xy, yaw, rng):
+    """Place the next pole from the landing, along the direction to the last pole."""
+    vehicle_xy = np.asarray(vehicle_xy, dtype=np.float64)
+    to_pole = np.asarray(pole_xy, dtype=np.float64) - vehicle_xy
+    if float(np.linalg.norm(to_pole)) < 1e-3:
+        bearing = yaw
+    else:
+        bearing = float(np.arctan2(to_pole[1], to_pole[0]))
+    return _random_pole(vehicle_xy, bearing, rng)
