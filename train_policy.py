@@ -23,7 +23,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def load_dataset(data_dir):
-    paths = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
+    paths = sorted(
+        glob.glob(os.path.join(data_dir, "episode_*.npz"))
+        + glob.glob(os.path.join(data_dir, "dagger_*.npz"))
+    )
     if not paths:
         raise SystemExit(f"No episode files in {data_dir}. Run iris_pole.py --collect first.")
     depths, states, actions = [], [], []

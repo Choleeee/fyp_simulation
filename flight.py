@@ -70,6 +70,7 @@ class ApproachSession:
         self.phase_started = time.monotonic()
         self.last_command = 0.0
         self.samples = []
+        self.missed_frames = 0
         self.done = False
         self._status_time = 0.0
         self.home_xy = None
@@ -115,6 +116,7 @@ class ApproachSession:
             self._arm(force=now - self.phase_started > 3.0)
             if self._armed():
                 self.samples = []
+                self.missed_frames = 0
                 self.phase = "fly"
                 self.phase_started = now
                 print(f"Episode {self.episode + 1}: pole at x={self.pole_xy[0]:.2f} y={self.pole_xy[1]:.2f}")
@@ -125,7 +127,7 @@ class ApproachSession:
 
         if self.phase == "fly":
             self._send(action)
-            self._record(state, expert_action)
+            self._record(state, action, expert_action)
             speed = float(np.linalg.norm(self.vehicle.state.linear_velocity))
             elapsed = now - self.phase_started
             if expert.reached_staging(position, self.pole_xy, speed):
@@ -194,17 +196,19 @@ class ApproachSession:
 
         return predict(self.policy, downsample_depth(depth), state)
 
-    def _record(self, state, expert_action):
-        if self.mode == "rollout":
-            return
+    def _record(self, state, executed_action, expert_action):
         depth = _read_depth(self.camera_sensor)
         if depth is None:
+            self.missed_frames += 1
             return
         observation = downsample_depth(depth)
         if self.mode == "collect":
             noise = np.random.normal(0.0, 0.01, observation.shape).astype(np.float32)
             observation = np.clip(observation + noise, 0.0, 1.0)
-        self.samples.append((observation, state, expert_action))
+        # Collect and DAgger store the expert command as the label.
+        # Rollout stores the command the policy actually sent.
+        label = executed_action if self.mode == "rollout" else expert_action
+        self.samples.append((observation, state, label))
 
     def _finish_episode(self, success):
         self._save(success)
@@ -213,11 +217,15 @@ class ApproachSession:
         self.phase_started = time.monotonic()
 
     def _save(self, success):
+        outcome = "success" if success else "failure"
         if not self.samples:
-            print(f"Episode {self.episode + 1} recorded no camera frames ({'success' if success else 'failure'})")
+            print(
+                f"Episode {self.episode + 1} recorded no camera frames ({outcome}, "
+                f"{self.missed_frames} reads empty)"
+            )
             return
         os.makedirs(self.data_dir, exist_ok=True)
-        prefix = "dagger" if self.mode == "dagger" else "episode"
+        prefix = {"dagger": "dagger", "rollout": "rollout"}.get(self.mode, "episode")
         path = os.path.join(self.data_dir, f"{prefix}_{int(time.time())}_{self.episode}.npz")
         depth, state, action = map(np.stack, zip(*self.samples))
         np.savez_compressed(
@@ -227,7 +235,8 @@ class ApproachSession:
             action=action.astype(np.float32),
             success=np.array([success]),
         )
-        print(f"Saved {len(self.samples)} samples to {path} ({'success' if success else 'failure'})")
+        missed = f", camera missed {self.missed_frames} steps" if self.missed_frames else ""
+        print(f"Saved {len(self.samples)} samples to {path} ({outcome}{missed})")
 
     def _send(self, flu_action):
         # PX4 body frame is forward-right-down, and its yaw rate is clockwise.
