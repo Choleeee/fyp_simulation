@@ -1,0 +1,282 @@
+"""Run privileged-expert or learned-policy approaches inside iris_pole.py.
+
+The vehicle is commanded in PX4 offboard mode. Each episode places the pole
+3–5 m from the Iris. Samples are written under simulation/data/.
+"""
+
+import os
+import time
+
+import numpy as np
+from pymavlink import mavutil
+from scipy.spatial.transform import Rotation
+
+import expert
+from task import (
+    CONTROL_PERIOD_S,
+    DISTANCE_MAX_M,
+    DISTANCE_MIN_M,
+    EPISODE_TIMEOUT_S,
+    LATERAL_MAX_M,
+    POLE_HEIGHT_M,
+    downsample_depth,
+)
+
+OFFBOARD_MODE = 6
+# Ignore position, acceleration, and yaw. Use body velocity and yaw rate.
+VELOCITY_MASK = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10)
+BODY_NED = 8
+
+
+def _yaw(attitude_xyzw):
+    return float(Rotation.from_quat(attitude_xyzw).as_euler("ZYX")[0])
+
+
+def _body_state(vehicle_state):
+    velocity = np.asarray(vehicle_state.linear_body_velocity, dtype=np.float32)
+    yaw_rate = float(vehicle_state.angular_velocity[2])
+    return np.array([velocity[0], velocity[1], velocity[2], yaw_rate], dtype=np.float32)
+
+
+def _read_depth(camera_sensor):
+    if not getattr(camera_sensor, "_camera_full_set", False):
+        return None
+    frame = camera_sensor._camera.get_current_frame()
+    if not frame:
+        return None
+    depth = frame.get("distance_to_image_plane")
+    if depth is None:
+        return None
+    return np.asarray(depth)
+
+
+class ApproachSession:
+    def __init__(self, vehicle, pole, camera_sensor, mode, episodes, policy_path, data_dir):
+        self.vehicle = vehicle
+        self.pole = pole
+        self.camera_sensor = camera_sensor
+        self.mode = mode
+        self.episodes_requested = episodes
+        self.policy_path = policy_path
+        self.data_dir = data_dir
+        self.policy = None
+        self.master = None
+        self.phase = "connect"
+        self.episode = 0
+        self.pole_xy = np.array([3.0, 0.0])
+        self.phase_started = time.monotonic()
+        self.last_command = 0.0
+        self.samples = []
+        self.done = False
+        self._status_time = 0.0
+
+        if mode in ("rollout", "dagger"):
+            if not os.path.isfile(policy_path):
+                raise SystemExit(f"Missing {policy_path}. Run train_policy.py after collecting episodes.")
+            from policy_net import load_policy
+
+            self.policy = load_policy(policy_path)
+
+    def finished(self):
+        return self.done
+
+    def on_step(self):
+        if self.done:
+            return
+        now = time.monotonic()
+        if self.phase == "connect":
+            self._connect()
+            return
+        if now - self.last_command < CONTROL_PERIOD_S:
+            return
+        self.last_command = now
+
+        position = np.asarray(self.vehicle.state.position, dtype=np.float64)
+        yaw = _yaw(self.vehicle.state.attitude)
+        expert_action = expert.command(position, yaw, self.pole_xy)
+        state = _body_state(self.vehicle.state)
+        action = self._select_action(expert_action, state)
+
+        if self.phase == "stream":
+            self._send(action)
+            if now - self.phase_started > 1.0:
+                self._set_offboard()
+                self._arm(force=False)
+                self.phase = "arm"
+                self.phase_started = now
+            return
+
+        if self.phase == "arm":
+            self._send(action)
+            self._arm(force=now - self.phase_started > 3.0)
+            if self._armed() or now - self.phase_started > 8.0:
+                self.samples = []
+                self.phase = "fly"
+                self.phase_started = now
+                print(f"Episode {self.episode + 1}: pole at x={self.pole_xy[0]:.2f} y={self.pole_xy[1]:.2f}")
+            return
+
+        if self.phase == "fly":
+            self._send(action)
+            self._record(state, expert_action)
+            speed = float(np.linalg.norm(self.vehicle.state.linear_velocity))
+            elapsed = now - self.phase_started
+            if expert.reached_staging(position, self.pole_xy, speed):
+                self._finish_episode(True)
+            elif expert.hit_pole(position, self.pole_xy) or elapsed > EPISODE_TIMEOUT_S:
+                self._finish_episode(False)
+            return
+
+        if self.phase == "land":
+            self._send(np.array([0.0, 0.0, -0.3, 0.0], dtype=np.float32))
+            if position[2] < 0.35 or now - self.phase_started > 15.0:
+                self._arm(force=False, disarm=True)
+                self.phase = "between"
+                self.phase_started = now
+            return
+
+        if self.phase == "between" and now - self.phase_started > 3.0:
+            self._begin_episode()
+
+    def _connect(self):
+        now = time.monotonic()
+        if self.master is None:
+            self.master = mavutil.mavlink_connection("udpin:0.0.0.0:14550", source_system=255)
+            self.phase_started = now
+        message = self.master.recv_match(type="HEARTBEAT", blocking=False)
+        if message is not None:
+            self.master.target_system = message.get_srcSystem()
+            self.master.target_component = message.get_srcComponent()
+            print(f"PX4 connected, system {self.master.target_system}")
+            self._begin_episode()
+        elif now - self._status_time > 5.0:
+            self._status_time = now
+            print("Waiting for PX4 heartbeat on UDP 14550")
+
+    def _begin_episode(self):
+        if self.episode >= self.episodes_requested:
+            self._disarm_and_stop()
+            return
+        position = np.asarray(self.vehicle.state.position, dtype=np.float64)
+        yaw = _yaw(self.vehicle.state.attitude)
+        self.pole_xy = _random_pole(position[:2], yaw, np.random.default_rng())
+        self.pole.set_world_pose(position=np.array([self.pole_xy[0], self.pole_xy[1], POLE_HEIGHT_M / 2.0]))
+        self.phase = "stream"
+        self.phase_started = time.monotonic()
+
+    def _select_action(self, expert_action, state):
+        if self.mode == "collect" or self.policy is None:
+            return expert_action
+        depth = _read_depth(self.camera_sensor)
+        if depth is None:
+            return expert_action
+        from policy_net import predict
+
+        return predict(self.policy, downsample_depth(depth), state)
+
+    def _record(self, state, expert_action):
+        if self.mode == "rollout":
+            return
+        depth = _read_depth(self.camera_sensor)
+        if depth is None:
+            return
+        observation = downsample_depth(depth)
+        if self.mode == "collect":
+            noise = np.random.normal(0.0, 0.01, observation.shape).astype(np.float32)
+            observation = np.clip(observation + noise, 0.0, 1.0)
+        self.samples.append((observation, state, expert_action))
+
+    def _finish_episode(self, success):
+        self._save(success)
+        self.episode += 1
+        self.phase = "land"
+        self.phase_started = time.monotonic()
+
+    def _save(self, success):
+        if not self.samples:
+            print(f"Episode {self.episode + 1} recorded no camera frames ({'success' if success else 'failure'})")
+            return
+        os.makedirs(self.data_dir, exist_ok=True)
+        prefix = "dagger" if self.mode == "dagger" else "episode"
+        path = os.path.join(self.data_dir, f"{prefix}_{int(time.time())}_{self.episode}.npz")
+        depth, state, action = map(np.stack, zip(*self.samples))
+        np.savez_compressed(
+            path,
+            depth=depth.astype(np.float16),
+            state=state.astype(np.float32),
+            action=action.astype(np.float32),
+            success=np.array([success]),
+        )
+        print(f"Saved {len(self.samples)} samples to {path} ({'success' if success else 'failure'})")
+
+    def _send(self, flu_action):
+        # PX4 body frame is forward-right-down, and its yaw rate is clockwise.
+        forward, left, up, yaw_rate_ccw = [float(value) for value in flu_action]
+        self.master.mav.set_position_target_local_ned_send(
+            0,
+            self.master.target_system,
+            self.master.target_component,
+            BODY_NED,
+            VELOCITY_MASK,
+            0,
+            0,
+            0,
+            forward,
+            -left,
+            -up,
+            0,
+            0,
+            0,
+            0,
+            -yaw_rate_ccw,
+        )
+
+    def _set_offboard(self):
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+            0,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            OFFBOARD_MODE,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+
+    def _arm(self, force=False, disarm=False):
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            0 if disarm else 1,
+            21196 if force and not disarm else 0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+
+    def _armed(self):
+        heartbeat = self.master.recv_match(type="HEARTBEAT", blocking=False)
+        if heartbeat is None:
+            return False
+        return bool(heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+
+    def _disarm_and_stop(self):
+        if self.master is not None:
+            self._arm(disarm=True)
+        self.done = True
+        print(f"Finished {self.episode} episodes")
+
+
+def _random_pole(vehicle_xy, yaw, rng):
+    distance = float(rng.uniform(DISTANCE_MIN_M, DISTANCE_MAX_M))
+    lateral = float(rng.uniform(-LATERAL_MAX_M, LATERAL_MAX_M))
+    forward = np.array([np.cos(yaw), np.sin(yaw)])
+    left = np.array([-np.sin(yaw), np.cos(yaw)])
+    return np.asarray(vehicle_xy, dtype=np.float64) + distance * forward + lateral * left
