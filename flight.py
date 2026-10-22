@@ -3,8 +3,8 @@
 The vehicle is commanded in PX4 offboard mode. It climbs at the start
 without recording, then the approach is recorded until the staging point,
 half a metre short of the pole. The vehicle lands on that spot. The next pole
-is placed 3–5 m from the landing, along the direction from that spot to the
-pole just reached.
+is placed 3–5 m from the landing on a new heading, at least 60 degrees off
+the direction to the pole just reached.
 """
 
 import os
@@ -348,11 +348,12 @@ def _random_pole(vehicle_xy, yaw, rng):
 
 
 def _next_pole(vehicle_xy, pole_xy, yaw, rng):
-    """Place the next pole from the landing, along the direction to the last pole."""
+    """Place the next pole from the landing, on a heading that is not straight ahead."""
     vehicle_xy = np.asarray(vehicle_xy, dtype=np.float64)
     to_pole = np.asarray(pole_xy, dtype=np.float64) - vehicle_xy
     if float(np.linalg.norm(to_pole)) < 1e-3:
-        bearing = yaw
+        previous = yaw
     else:
-        bearing = float(np.arctan2(to_pole[1], to_pole[0]))
-    return _random_pole(vehicle_xy, bearing, rng)
+        previous = float(np.arctan2(to_pole[1], to_pole[0]))
+    turn = float(rng.choice([-1.0, 1.0]) * rng.uniform(np.pi / 3, np.pi))
+    return _random_pole(vehicle_xy, previous + turn, rng)

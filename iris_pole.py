@@ -6,8 +6,8 @@ Scene only, for a manual takeoff:
     isaac_run /path/to/iris_pole.py
 
 Collect expert demonstrations. Recording stops at the staging point, the
-vehicle lands there, and the next pole is placed from that landing along the
-direction to the pole. Close any MAVLink shell first; this listens on UDP 14550.
+vehicle lands there, and the next pole is placed from that landing on a new
+heading. Close any MAVLink shell first; this listens on UDP 14550.
 
     isaac_run /path/to/iris_pole.py --collect --episodes 5
 
