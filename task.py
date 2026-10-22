@@ -6,8 +6,8 @@ POLE_DIAMETER_M = 0.076
 POLE_HEIGHT_M = 4.0
 POLE_RADIUS_M = POLE_DIAMETER_M / 2.0
 
-# The learned policy stops at this distance from the pole. It does not make contact.
-STANDOFF_M = 1.0
+# Stop short of the column. 0.5 m from the centre is about 0.46 m from the surface.
+STANDOFF_M = 0.5
 TARGET_ALTITUDE_M = 1.5
 
 DISTANCE_MIN_M = 3.0
@@ -20,7 +20,8 @@ KP_HORIZONTAL = 0.6
 KP_VERTICAL = 0.8
 KP_YAW = 1.0
 
-SUCCESS_RADIUS_M = 0.3
+# Keep the success disk outside the hit volume around the 0.5 m staging point.
+SUCCESS_RADIUS_M = 0.15
 SUCCESS_ALTITUDE_M = 0.3
 SUCCESS_SPEED_M_S = 0.3
 HIT_RADIUS_M = POLE_RADIUS_M + 0.15

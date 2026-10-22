@@ -2,7 +2,7 @@
 
 The vehicle is commanded in PX4 offboard mode. It climbs at the start
 without recording, then the approach is recorded until the staging point,
-one metre short of the pole. The vehicle lands on that spot. The next pole
+half a metre short of the pole. The vehicle lands on that spot. The next pole
 is placed 3–5 m from the landing, along the direction from that spot to the
 pole just reached.
 """

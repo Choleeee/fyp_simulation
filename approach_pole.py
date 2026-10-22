@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fly the simulated Iris to a hover 1 m in front of the 76 mm pole.
+"""Fly the simulated Iris to a hover 0.5 m in front of the 76 mm pole.
 
 Start iris_pole.py first and wait until PX4 prints "Ready for takeoff".
 Close the MAVLink shell before running this; both listen on UDP port 14550.
@@ -8,7 +8,7 @@ Close the MAVLink shell before running this; both listen on UDP port 14550.
 
 The pole in iris_pole.py is 3 m along world +X. PX4's local frame is
 north-east-down, and that direction is east, so the target is
-north = 0, east = 2 m, 1.5 m above the origin. If the vehicle flies
+north = 0, east = 2.5 m, 1.5 m above the origin. If the vehicle flies
 the wrong way, swap TARGET_NORTH_M and TARGET_EAST_M.
 """
 
@@ -17,9 +17,9 @@ import time
 
 from pymavlink import mavutil
 
-# 3 m pole, 1 m standoff, so the vehicle stops before contact.
+# 3 m pole, 0.5 m standoff, so the vehicle stops before contact.
 TARGET_NORTH_M = 0.0
-TARGET_EAST_M = 2.0
+TARGET_EAST_M = 2.5
 TARGET_ALTITUDE_M = 1.5
 TARGET_YAW_RAD = math.pi / 2.0  # face east, toward the pole
 
