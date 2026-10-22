@@ -19,10 +19,13 @@ from task import (
     EPISODE_TIMEOUT_S,
     LATERAL_MAX_M,
     POLE_HEIGHT_M,
+    TARGET_ALTITUDE_M,
     downsample_depth,
 )
 
 OFFBOARD_MODE = 6
+AUTO_MODE = 4
+AUTO_LAND = 6
 # Ignore position, acceleration, and yaw. Use body velocity and yaw rate.
 VELOCITY_MASK = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10)
 BODY_NED = 8
@@ -69,6 +72,7 @@ class ApproachSession:
         self.samples = []
         self.done = False
         self._status_time = 0.0
+        self.home_xy = None
 
         if mode in ("rollout", "dagger"):
             if not os.path.isfile(policy_path):
@@ -109,11 +113,14 @@ class ApproachSession:
         if self.phase == "arm":
             self._send(action)
             self._arm(force=now - self.phase_started > 3.0)
-            if self._armed() or now - self.phase_started > 8.0:
+            if self._armed():
                 self.samples = []
                 self.phase = "fly"
                 self.phase_started = now
                 print(f"Episode {self.episode + 1}: pole at x={self.pole_xy[0]:.2f} y={self.pole_xy[1]:.2f}")
+            elif now - self.phase_started > 12.0:
+                print(f"Episode {self.episode + 1} did not arm")
+                self._finish_episode(False)
             return
 
         if self.phase == "fly":
@@ -127,15 +134,25 @@ class ApproachSession:
                 self._finish_episode(False)
             return
 
+        if self.phase == "return":
+            back = expert.fly_to(position, yaw, self.home_xy, TARGET_ALTITUDE_M)
+            self._send(back)
+            home_distance = float(np.linalg.norm(position[:2] - self.home_xy))
+            if home_distance < 0.4 or now - self.phase_started > EPISODE_TIMEOUT_S:
+                self._set_land_mode()
+                self.phase = "land"
+                self.phase_started = now
+            return
+
         if self.phase == "land":
-            self._send(np.array([0.0, 0.0, -0.3, 0.0], dtype=np.float32))
-            if position[2] < 0.35 or now - self.phase_started > 15.0:
-                self._arm(force=False, disarm=True)
+            self._set_land_mode()
+            landed = position[2] < 0.25 and not self._armed()
+            if landed or now - self.phase_started > 25.0:
                 self.phase = "between"
                 self.phase_started = now
             return
 
-        if self.phase == "between" and now - self.phase_started > 3.0:
+        if self.phase == "between" and now - self.phase_started > 2.0:
             self._begin_episode()
 
     def _connect(self):
@@ -148,6 +165,7 @@ class ApproachSession:
             self.master.target_system = message.get_srcSystem()
             self.master.target_component = message.get_srcComponent()
             print(f"PX4 connected, system {self.master.target_system}")
+            self._disable_battery_failsafe()
             self._begin_episode()
         elif now - self._status_time > 5.0:
             self._status_time = now
@@ -158,8 +176,10 @@ class ApproachSession:
             self._disarm_and_stop()
             return
         position = np.asarray(self.vehicle.state.position, dtype=np.float64)
-        yaw = _yaw(self.vehicle.state.attitude)
-        self.pole_xy = _random_pole(position[:2], yaw, np.random.default_rng())
+        if self.home_xy is None:
+            self.home_xy = position[:2].copy()
+        yaw = float(np.random.default_rng().uniform(-np.pi, np.pi))
+        self.pole_xy = _random_pole(self.home_xy, yaw, np.random.default_rng())
         self.pole.set_world_pose(position=np.array([self.pole_xy[0], self.pole_xy[1], POLE_HEIGHT_M / 2.0]))
         self.phase = "stream"
         self.phase_started = time.monotonic()
@@ -189,7 +209,7 @@ class ApproachSession:
     def _finish_episode(self, success):
         self._save(success)
         self.episode += 1
-        self.phase = "land"
+        self.phase = "return"
         self.phase_started = time.monotonic()
 
     def _save(self, success):
@@ -229,6 +249,35 @@ class ApproachSession:
             0,
             0,
             -yaw_rate_ccw,
+        )
+
+    def _disable_battery_failsafe(self):
+        # A long collection otherwise trips the simulated low-battery failsafe.
+        for name, value, ptype in (
+            ("COM_LOW_BAT_ACT", 0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
+            ("SIM_BAT_DRAIN", 0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+        ):
+            self.master.mav.param_set_send(
+                self.master.target_system,
+                self.master.target_component,
+                name.encode("utf-8"),
+                float(value),
+                ptype,
+            )
+
+    def _set_land_mode(self):
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+            0,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            AUTO_MODE,
+            AUTO_LAND,
+            0,
+            0,
+            0,
+            0,
         )
 
     def _set_offboard(self):

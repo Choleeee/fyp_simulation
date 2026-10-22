@@ -44,8 +44,9 @@ CONTROL_PERIOD_S = 0.1
 
 def camera_intrinsics():
     """Pinhole intrinsics for the training camera, in pixel units."""
+    # Isaac Sim forces square pixels, so fy has to equal fx or the camera bridge warns and overwrites it.
     fx = 0.5 * CAMERA_WIDTH / np.tan(np.radians(CAMERA_HFOV_DEG) / 2.0)
-    fy = 0.5 * CAMERA_HEIGHT / np.tan(np.radians(CAMERA_VFOV_DEG) / 2.0)
+    fy = fx
     return np.array(
         [
             [fx, 0.0, CAMERA_WIDTH / 2.0],

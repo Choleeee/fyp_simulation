@@ -31,6 +31,32 @@ def _clip_horizontal(forward, left):
     return forward, left
 
 
+def fly_to(position, yaw, target_xy, altitude):
+    """Velocity command toward an exact point, used to return to the spawn."""
+    position = np.asarray(position, dtype=np.float64)
+    target_xy = np.asarray(target_xy, dtype=np.float64)
+    error_xy = target_xy - position[:2]
+    forward_axis = np.array([np.cos(yaw), np.sin(yaw)])
+    left_axis = np.array([-np.sin(yaw), np.cos(yaw)])
+    forward, left = _clip_horizontal(
+        KP_HORIZONTAL * float(np.dot(error_xy, forward_axis)),
+        KP_HORIZONTAL * float(np.dot(error_xy, left_axis)),
+    )
+    up = float(np.clip(KP_VERTICAL * (altitude - position[2]), -V_MAX_M_S, V_MAX_M_S))
+    distance = float(np.linalg.norm(error_xy))
+    if distance < 0.3:
+        yaw_rate = 0.0
+    else:
+        yaw_rate = float(
+            np.clip(
+                KP_YAW * wrap_angle(np.arctan2(error_xy[1], error_xy[0]) - yaw),
+                -YAW_RATE_MAX_RAD_S,
+                YAW_RATE_MAX_RAD_S,
+            )
+        )
+    return np.array([forward, left, up, yaw_rate], dtype=np.float32)
+
+
 def command(position, yaw, pole_xy):
     """Return forward, left, up velocity (m/s) and CCW yaw rate (rad/s)."""
     position = np.asarray(position, dtype=np.float64)
