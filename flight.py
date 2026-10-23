@@ -2,9 +2,10 @@
 
 The vehicle is commanded in PX4 offboard mode. It climbs at the start
 without recording, then the approach is recorded until the staging point,
-half a metre short of the pole. The vehicle lands on that spot. The next pole
-is placed 3–5 m from the landing on a new heading, at least 60 degrees off
-the direction to the pole just reached.
+half a metre short of the pole. If the column is outside the camera, the
+vehicle yaws in place until the depth image shows it, then approaches. It
+lands on that spot. The next pole is placed 3–5 m from the landing on a new
+heading, at least 60 degrees off the direction to the pole just reached.
 """
 
 import os
@@ -16,14 +17,20 @@ from scipy.spatial.transform import Rotation
 
 import expert
 from task import (
+    CAMERA_HFOV_DEG,
     CONTROL_PERIOD_S,
     DISTANCE_MAX_M,
     DISTANCE_MIN_M,
     EPISODE_TIMEOUT_S,
+    KP_VERTICAL,
     LATERAL_MAX_M,
     POLE_HEIGHT_M,
     TARGET_ALTITUDE_M,
+    V_MAX_M_S,
+    YAW_RATE_MAX_RAD_S,
     downsample_depth,
+    pole_visible,
+    wrap_angle,
 )
 
 OFFBOARD_MODE = 6
@@ -74,6 +81,7 @@ class ApproachSession:
         self.last_command = 0.0
         self.samples = []
         self.missed_frames = 0
+        self.searching = False
         self.done = False
         self._status_time = 0.0
 
@@ -93,6 +101,23 @@ class ApproachSession:
         now = time.monotonic()
         if self.phase == "connect":
             self._connect()
+            return
+        if self.phase == "configure":
+            if now - self.last_command >= 0.5:
+                self.last_command = now
+                self._recharge_battery()
+            if now - self.phase_started > 3.0:
+                self._begin_episode()
+            return
+        if self.phase == "recharge":
+            if now - self.last_command >= 0.2:
+                self.last_command = now
+                self._recharge_battery()
+            if now - self.phase_started > 1.0:
+                self._release_battery_floor()
+                print(f"Episode {self.episode + 1}: battery recharged")
+                self.phase = "stream"
+                self.phase_started = now
             return
         if now - self.last_command < CONTROL_PERIOD_S:
             return
@@ -117,6 +142,7 @@ class ApproachSession:
             self._send(action)
             self._arm(force=now - self.phase_started > 3.0)
             if self._armed():
+                self._set_offboard()
                 self.phase = "takeoff"
                 self.phase_started = now
             elif now - self.phase_started > 12.0:
@@ -132,6 +158,7 @@ class ApproachSession:
             if abs(position[2] - TARGET_ALTITUDE_M) < 0.3 and vertical_speed < 0.3:
                 self.samples = []
                 self.missed_frames = 0
+                self.searching = False
                 self.phase = "fly"
                 self.phase_started = now
                 print(f"Episode {self.episode + 1}: pole at x={self.pole_xy[0]:.2f} y={self.pole_xy[1]:.2f}")
@@ -141,6 +168,15 @@ class ApproachSession:
             return
 
         if self.phase == "fly":
+            depth = _read_depth(self.camera_sensor)
+            if not _pole_detected(position, yaw, self.pole_xy, depth):
+                action = _yaw_search(position, yaw, self.pole_xy)
+                if not self.searching:
+                    self.searching = True
+                    print(f"Episode {self.episode + 1}: pole outside the camera, yawing")
+            elif self.searching:
+                self.searching = False
+                print(f"Episode {self.episode + 1}: pole in the camera view")
             self._send(action)
             self._record(state, action, expert_action)
             speed = float(np.linalg.norm(self.vehicle.state.linear_velocity))
@@ -174,8 +210,11 @@ class ApproachSession:
             self.master.target_system = message.get_srcSystem()
             self.master.target_component = message.get_srcComponent()
             print(f"PX4 connected, system {self.master.target_system}")
-            self._disable_battery_failsafe()
-            self._begin_episode()
+            # PX4 is still loading the airframe here. Repeat the battery writes
+            # for a few seconds so the boot defaults do not replace them.
+            self.phase = "configure"
+            self.phase_started = now
+            self.last_command = 0.0
         elif now - self._status_time > 5.0:
             self._status_time = now
             print("Waiting for PX4 heartbeat on UDP 14550")
@@ -184,12 +223,15 @@ class ApproachSession:
         if self.episode >= self.episodes_requested:
             self._disarm_and_stop()
             return
+        self.samples = []
+        self.missed_frames = 0
         position = np.asarray(self.vehicle.state.position, dtype=np.float64)
         yaw = _yaw(self.vehicle.state.attitude)
         self.pole_xy = _next_pole(position[:2], self.pole_xy, yaw, np.random.default_rng())
         self.pole.set_world_pose(position=np.array([self.pole_xy[0], self.pole_xy[1], POLE_HEIGHT_M / 2.0]))
-        self.phase = "stream"
+        self.phase = "recharge"
         self.phase_started = time.monotonic()
+        self.last_command = 0.0
 
     def _select_action(self, expert_action, state):
         if self.mode == "collect" or self.policy is None:
@@ -267,19 +309,26 @@ class ApproachSession:
             -yaw_rate_ccw,
         )
 
-    def _disable_battery_failsafe(self):
-        # A long collection otherwise trips the simulated low-battery failsafe.
-        for name, value, ptype in (
-            ("COM_LOW_BAT_ACT", 0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
-            ("SIM_BAT_DRAIN", 0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
-        ):
-            self.master.mav.param_set_send(
-                self.master.target_system,
-                self.master.target_component,
-                name.encode("utf-8"),
-                float(value),
-                ptype,
-            )
+    def _set_param(self, name, value, ptype):
+        self.master.mav.param_set_send(
+            self.master.target_system,
+            self.master.target_component,
+            name.encode("utf-8"),
+            float(value),
+            ptype,
+        )
+
+    def _recharge_battery(self):
+        # PX4 raises the simulated charge up to SIM_BAT_MIN_PCT. Holding that
+        # floor at 100% for a moment fills the battery. It does not recharge
+        # on its own between episodes.
+        self._set_param("SIM_BAT_MIN_PCT", 100, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+        self._set_param("COM_LOW_BAT_ACT", 0, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
+
+    def _release_battery_floor(self):
+        # The charge is already at 100%. Restore the normal SITL floor so this
+        # episode can discharge from full instead of staying locked at 100%.
+        self._set_param("SIM_BAT_MIN_PCT", 50, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
 
     def _set_land_mode(self):
         self.master.mav.command_long_send(
@@ -337,6 +386,34 @@ class ApproachSession:
             self._arm(disarm=True)
         self.done = True
         print(f"Finished {self.episode} episodes")
+
+
+def _view_error(position, yaw, pole_xy):
+    to_pole = np.asarray(pole_xy, dtype=np.float64) - np.asarray(position[:2], dtype=np.float64)
+    if float(np.linalg.norm(to_pole)) < 1e-3:
+        return 0.0
+    return wrap_angle(float(np.arctan2(to_pole[1], to_pole[0])) - yaw)
+
+
+def _pole_detected(position, yaw, pole_xy, depth):
+    """The column is in the camera when its bearing is inside the field of view and the depth image shows it."""
+    error = abs(_view_error(position, yaw, pole_xy))
+    half_fov = np.radians(CAMERA_HFOV_DEG) / 2.0
+    if error > half_fov * 0.85:
+        return False
+    if error < np.radians(8.0):
+        return True
+    if depth is None:
+        return False
+    return pole_visible(depth)
+
+
+def _yaw_search(position, yaw, pole_xy):
+    """Yaw toward the pole. Hold the horizontal position and the approach altitude."""
+    error = _view_error(position, yaw, pole_xy)
+    direction = 1.0 if error >= 0.0 else -1.0
+    up = float(np.clip(KP_VERTICAL * (TARGET_ALTITUDE_M - float(position[2])), -V_MAX_M_S, V_MAX_M_S))
+    return np.array([0.0, 0.0, up, direction * YAW_RATE_MAX_RAD_S], dtype=np.float32)
 
 
 def _random_pole(vehicle_xy, yaw, rng):

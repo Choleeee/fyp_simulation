@@ -62,19 +62,47 @@ def wrap_angle(angle):
     return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
 
-def downsample_depth(depth):
-    """Convert a depth image in metres to the fixed observation size.
-
-    Each block keeps the nearest return. Averaging would hide the column,
-    which is only a few pixels wide. Missing returns are treated as far.
-    """
+def _depth_metres(depth):
     depth = np.asarray(depth, dtype=np.float32)
     if depth.ndim == 3:
         depth = depth[..., 0]
     depth = np.nan_to_num(depth, nan=DEPTH_MAX_M, posinf=DEPTH_MAX_M, neginf=DEPTH_MAX_M)
     depth = np.clip(depth, 0.0, DEPTH_MAX_M)
     depth[depth < DEPTH_MIN_M] = DEPTH_MAX_M
+    return depth
 
+
+def pole_visible(depth):
+    """True when a narrow vertical column stands out from both sides of the depth image."""
+    depth = _depth_metres(depth)
+    height, width = depth.shape
+    if height < 16 or width < 32:
+        return False
+    body = depth[int(height * 0.05) : int(height * 0.75), :]
+    column_min = body.min(axis=0)
+    gap = max(6, width // 80)
+    half = max(gap + 4, width // 16)
+    for x in range(half, width - half):
+        near = float(column_min[x])
+        if not 0.4 < near < 8.0:
+            continue
+        left = float(np.median(column_min[x - half : x - gap]))
+        right = float(np.median(column_min[x + gap : x + half]))
+        if left - near < 0.4 or right - near < 0.4:
+            continue
+        column = body[:, max(0, x - 1) : x + 2]
+        if float(np.mean(np.abs(column - near) < 0.5)) > 0.2:
+            return True
+    return False
+
+
+def downsample_depth(depth):
+    """Convert a depth image in metres to the fixed observation size.
+
+    Each block keeps the nearest return. Averaging would hide the column,
+    which is only a few pixels wide. Missing returns are treated as far.
+    """
+    depth = _depth_metres(depth)
     src_h, src_w = depth.shape
     ys = np.linspace(0, src_h, OBS_HEIGHT + 1).astype(int)
     xs = np.linspace(0, src_w, OBS_WIDTH + 1).astype(int)
