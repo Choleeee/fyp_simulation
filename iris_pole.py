@@ -111,15 +111,12 @@ def _bind_color(stage, prim, path, color, emissive=None):
 
 
 def _add_box(stage, path, translate, scale, color, emissive=None):
-    """Unit cube, scaled and then moved in the pole's local frame."""
-    box = UsdGeom.Cube.Define(stage, path)
+    """Cube in the pole's local frame. Translation is on the parent, so the size scale cannot pull it down the shaft."""
+    mount = UsdGeom.Xform.Define(stage, path)
+    mount.AddTranslateOp().Set(Gf.Vec3d(*translate))
+    box = UsdGeom.Cube.Define(stage, path + "/Geom")
     box.CreateSizeAttr(1.0)
-    xform = UsdGeom.Xformable(box.GetPrim())
-    scale_op = xform.AddScaleOp()
-    scale_op.Set(Gf.Vec3f(*scale))
-    move_op = xform.AddTranslateOp()
-    move_op.Set(Gf.Vec3d(*translate))
-    xform.SetXformOpOrder([scale_op, move_op])
+    UsdGeom.Xformable(box.GetPrim()).AddScaleOp().Set(Gf.Vec3f(*scale))
     _bind_color(stage, box.GetPrim(), path + "/Looks", color, emissive)
     return box
 
@@ -182,25 +179,25 @@ def _dress_as_lamppost(pole_path):
     shaft = stage.GetPrimAtPath(pole_path)
     _bind_color(stage, shaft, pole_path + "/Looks", (0.12, 0.13, 0.14))
     _add_base(stage, pole_path)
-    # Arm starts at the shaft surface and reaches out along world +X.
+    # Bracket and lamp sit on the top of the shaft and reach out along world +X.
     _add_box(
         stage,
         pole_path + "/arm",
-        translate=(0.32, 0.0, top - 0.05),
+        translate=(0.32, 0.0, top),
         scale=(0.56, 0.04, 0.04),
         color=(0.16, 0.16, 0.17),
     )
     _add_box(
         stage,
         pole_path + "/head",
-        translate=(0.52, 0.0, top - 0.16),
-        scale=(0.22, 0.14, 0.10),
+        translate=(0.52, 0.0, top - 0.04),
+        scale=(0.22, 0.14, 0.08),
         color=(0.18, 0.18, 0.19),
     )
     _add_box(
         stage,
         pole_path + "/lamp",
-        translate=(0.52, 0.0, top - 0.22),
+        translate=(0.52, 0.0, top - 0.09),
         scale=(0.14, 0.08, 0.02),
         color=(1.0, 0.78, 0.35),
         emissive=(1.0, 0.72, 0.25),
