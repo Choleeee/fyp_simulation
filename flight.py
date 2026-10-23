@@ -168,7 +168,7 @@ class ApproachSession:
 
         if self.phase == "takeoff":
             # A body-up velocity never settles: it is still climbing when the
-            # height check becomes true. A position setpoint holds 1.5 m.
+            # height check becomes true. A position setpoint holds 3.0 m.
             self._set_offboard()
             self._command_climb(position)
             height_error = abs(float(position[2]) - TARGET_ALTITUDE_M)

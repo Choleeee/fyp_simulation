@@ -8,7 +8,7 @@ POLE_RADIUS_M = POLE_DIAMETER_M / 2.0
 
 # Stop short of the column. 0.5 m from the centre is about 0.46 m from the surface.
 STANDOFF_M = 0.5
-TARGET_ALTITUDE_M = 1.5
+TARGET_ALTITUDE_M = 3.0
 
 DISTANCE_MIN_M = 3.0
 DISTANCE_MAX_M = 5.0
