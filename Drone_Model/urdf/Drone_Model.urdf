@@ -1,0 +1,150 @@
+<?xml version="1.0"?>
+<robot name="FULL_ASSEM_0802_ForInsert">
+  
+  <!-- ==================== BASE LINK ==================== -->
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/base_link.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="base_link_material">
+        <color rgba="0.7 0.7 0.7 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/base_link.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.000314513028 -0.000785891232 -0.00154869973" rpy="0 0 0"/>
+      <mass value="4.28055421"/>
+      <inertia ixx="0.0195575558" ixy="4.10735498e-05" ixz="-2.62862638e-05" iyy="0.0212429024" iyz="0.000522947808" izz="0.0339964744"/>
+    </inertial>
+  </link>
+
+  <!-- ==================== PROPELLERS ==================== -->
+  <link name="Propeller_CCW_Puller_2">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/propeller_ccw_puller_2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="propeller_ccw_puller_2_material">
+        <color rgba="0.1 0.1 0.1 1.0"/> <!-- Fixed Alpha from 0 to 1.0 -->
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/propeller_ccw_puller_2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-3.39738274e-08 6.02713183e-07 -0.00230785018" rpy="0 0 0"/>
+      <mass value="0.0239168437"/>
+      <inertia ixx="7.98487703e-06" ixy="6.67174983e-11" ixz="-1.14172689e-11" iyy="7.98504507e-06" iyz="3.35359918e-12" izz="1.56210376e-05"/>
+    </inertial>
+  </link>
+
+  <link name="Propeller_CCW_Puller_1">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/propeller_ccw_puller_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="propeller_ccw_puller_1_material">
+        <color rgba="0.1 0.1 0.1 1.0"/> <!-- Fixed Alpha from 0 to 1.0 -->
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/propeller_ccw_puller_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="5.22410003e-07 -3.02498249e-07 -0.00230785018" rpy="0 0 0"/>
+      <mass value="0.0239168437"/>
+      <inertia ixx="7.98493319e-06" ixy="-1.03610266e-10" ixz="9.07116449e-12" iyy="7.98498891e-06" iyz="7.70159932e-12" izz="1.56210376e-05"/>
+    </inertial>
+  </link>
+
+  <link name="Propeller_CW_Puller_1">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/propeller_cw_puller_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="propeller_cw_puller_1_material">
+        <color rgba="0.1 0.1 0.1 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/propeller_cw_puller_1.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="1.66745703e-07 -5.41275191e-07 -0.00230782331" rpy="0 0 0"/>
+      <mass value="0.0239172691"/>
+      <inertia ixx="7.98521991e-06" ixy="-2.85668861e-11" ixz="2.4460509e-12" iyy="7.98497536e-06" iyz="-7.48296934e-12" izz="1.56213063e-05"/>
+    </inertial>
+  </link>
+
+  <link name="Propeller_CW_Puller_2">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/propeller_cw_puller_2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="propeller_cw_puller_2_material">
+        <color rgba="0.1 0.1 0.1 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="../meshes/propeller_cw_puller_2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-2.64832341e-07 -5.00646375e-07 -0.00230782331" rpy="0 0 0"/>
+      <mass value="0.0239172691"/>
+      <inertia ixx="7.98506907e-06" ixy="-1.2227206e-10" ixz="-3.56163921e-12" iyy="7.9851262e-06" iyz="-7.02087755e-12" izz="1.56213063e-05"/>
+    </inertial>
+  </link>
+
+  <!-- ==================== JOINTS ==================== -->
+  <joint name="Revolute_73" type="continuous">
+    <origin xyz="-0.109217294 0.0793510091 0.029" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="Propeller_CCW_Puller_2"/>
+    <axis xyz="0 0 -1"/>
+  </joint>
+
+  <joint name="Revolute_74" type="continuous">
+    <origin xyz="0.109217294 -0.0793510091 0.029" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="Propeller_CCW_Puller_1"/>
+    <axis xyz="0 0 -1"/>
+  </joint>
+
+  <joint name="Revolute_75" type="continuous">
+    <origin xyz="0.109217294 0.0793510091 0.029" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="Propeller_CW_Puller_1"/>
+    <axis xyz="0 0 -1"/>
+  </joint>
+
+  <joint name="Revolute_76" type="continuous">
+    <origin xyz="-0.109217294 -0.0793510091 0.029" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="Propeller_CW_Puller_2"/>
+    <axis xyz="0 0 -1"/>
+  </joint>
+
+</robot>
