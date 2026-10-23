@@ -42,8 +42,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default=os.path.join(HERE, "data"))
     parser.add_argument("--out", default=os.path.join(HERE, "policy.pt"))
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch", type=int, default=100)
     args = parser.parse_args()
 
     depth, state, action, paths = load_dataset(args.data)
