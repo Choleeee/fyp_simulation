@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<robot name="FULL_ASSEM_0802_ForInsert">
+<robot name="FYP-Drone">
   
   <!-- ==================== BASE LINK ==================== -->
   <link name="base_link">
@@ -119,28 +119,28 @@
   </link>
 
   <!-- ==================== JOINTS ==================== -->
-  <joint name="Revolute_73" type="continuous">
+  <joint name="Rear-Left-Joint" type="continuous">
     <origin xyz="-0.109217294 0.0793510091 0.029" rpy="0 0 0"/>
     <parent link="base_link"/>
     <child link="Propeller_CCW_Puller_2"/>
     <axis xyz="0 0 -1"/>
   </joint>
 
-  <joint name="Revolute_74" type="continuous">
+  <joint name="Front-Right-Joint" type="continuous">
     <origin xyz="0.109217294 -0.0793510091 0.029" rpy="0 0 0"/>
     <parent link="base_link"/>
     <child link="Propeller_CCW_Puller_1"/>
     <axis xyz="0 0 -1"/>
   </joint>
 
-  <joint name="Revolute_75" type="continuous">
+  <joint name="Rear-Right-Joint" type="continuous">
     <origin xyz="0.109217294 0.0793510091 0.029" rpy="0 0 0"/>
     <parent link="base_link"/>
     <child link="Propeller_CW_Puller_1"/>
     <axis xyz="0 0 -1"/>
   </joint>
 
-  <joint name="Revolute_76" type="continuous">
+  <joint name="Front-Left-Joint" type="continuous">
     <origin xyz="-0.109217294 -0.0793510091 0.029" rpy="0 0 0"/>
     <parent link="base_link"/>
     <child link="Propeller_CW_Puller_2"/>
