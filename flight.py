@@ -38,7 +38,12 @@ AUTO_MODE = 4
 AUTO_LAND = 6
 # Ignore position, acceleration, and yaw. Use body velocity and yaw rate.
 VELOCITY_MASK = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10)
+# Ignore velocity, acceleration, yaw, and yaw rate. Use local position.
+POSITION_MASK = (
+    (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10) | (1 << 11)
+)
 BODY_NED = 8
+LOCAL_NED = 1
 
 
 def _yaw(attitude_xyzw):
@@ -143,6 +148,14 @@ class ApproachSession:
             self._arm(force=now - self.phase_started > 3.0)
             if self._armed():
                 self._set_offboard()
+                self.takeoff_ned = None
+                self.master.mav.request_data_stream_send(
+                    self.master.target_system,
+                    self.master.target_component,
+                    mavutil.mavlink.MAV_DATA_STREAM_POSITION,
+                    10,
+                    1,
+                )
                 self.phase = "takeoff"
                 self.phase_started = now
             elif now - self.phase_started > 12.0:
@@ -151,19 +164,24 @@ class ApproachSession:
             return
 
         if self.phase == "takeoff":
-            # Climb at the landing spot. The approach recording starts at altitude.
-            climb = float(np.clip(0.8 * (TARGET_ALTITUDE_M - position[2]), -0.5, 0.5))
-            self._send(np.array([0.0, 0.0, climb, 0.0], dtype=np.float32))
+            # A body-up velocity never settles: it is still climbing when the
+            # height check becomes true. A position setpoint holds 1.5 m.
+            self._set_offboard()
+            self._command_climb(position)
+            height_error = abs(float(position[2]) - TARGET_ALTITUDE_M)
             vertical_speed = abs(float(self.vehicle.state.linear_velocity[2]))
-            if abs(position[2] - TARGET_ALTITUDE_M) < 0.3 and vertical_speed < 0.3:
+            if height_error < 0.3 and vertical_speed < 0.35:
                 self.samples = []
                 self.missed_frames = 0
                 self.searching = False
                 self.phase = "fly"
                 self.phase_started = now
                 print(f"Episode {self.episode + 1}: pole at x={self.pole_xy[0]:.2f} y={self.pole_xy[1]:.2f}")
-            elif now - self.phase_started > 20.0:
-                print(f"Episode {self.episode + 1} did not reach approach altitude")
+            elif now - self.phase_started > 30.0:
+                print(
+                    f"Episode {self.episode + 1} did not reach approach altitude "
+                    f"(z={float(position[2]):.2f})"
+                )
                 self._finish_episode(False, "no climb")
             return
 
@@ -286,6 +304,39 @@ class ApproachSession:
         )
         missed = f", camera missed {self.missed_frames} steps" if self.missed_frames else ""
         print(f"Saved {len(self.samples)} samples to {path} ({reason}{missed})")
+
+    def _command_climb(self, position):
+        if self.takeoff_ned is None:
+            local = self.master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
+            if local is None:
+                climb = float(np.clip(0.5 * (TARGET_ALTITUDE_M - position[2]), -0.4, 0.4))
+                self._send(np.array([0.0, 0.0, climb, 0.0], dtype=np.float32))
+                return
+            # PX4 down is negative above the origin. Shift by the height still to climb.
+            self.takeoff_ned = (
+                float(local.x),
+                float(local.y),
+                float(local.z) - (TARGET_ALTITUDE_M - float(position[2])),
+            )
+        north, east, down = self.takeoff_ned
+        self.master.mav.set_position_target_local_ned_send(
+            0,
+            self.master.target_system,
+            self.master.target_component,
+            LOCAL_NED,
+            POSITION_MASK,
+            north,
+            east,
+            down,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
 
     def _send(self, flu_action):
         # PX4 body frame is forward-right-down, and its yaw rate is clockwise.
