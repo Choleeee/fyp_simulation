@@ -16,6 +16,7 @@ from pymavlink import mavutil
 from scipy.spatial.transform import Rotation
 
 import expert
+from supervisor import ApproachSupervisor, Command
 from task import (
     CAMERA_HFOV_DEG,
     CONTROL_PERIOD_S,
@@ -35,6 +36,7 @@ from task import (
 
 OFFBOARD_MODE = 6
 AUTO_MODE = 4
+AUTO_RTL = 5
 AUTO_LAND = 6
 # Ignore position, acceleration, and yaw. Use body velocity and yaw rate.
 VELOCITY_MASK = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10)
@@ -87,6 +89,7 @@ class ApproachSession:
         self.samples = []
         self.missed_frames = 0
         self.searching = False
+        self.supervisor = ApproachSupervisor()
         self.done = False
         self._status_time = 0.0
 
@@ -195,6 +198,19 @@ class ApproachSession:
             elif self.searching:
                 self.searching = False
                 print(f"Episode {self.episode + 1}: pole in the camera view")
+            if not self.supervisor.poll(now):
+                self._reject(self.supervisor.reason)
+                return
+            allowed = self.supervisor.evaluate(
+                Command.from_action(action, now),
+                position,
+                yaw,
+                self.pole_xy,
+                now,
+            )
+            if not allowed:
+                self._reject(self.supervisor.reason)
+                return
             self._send(action)
             self._record(state, action, expert_action)
             speed = float(np.linalg.norm(self.vehicle.state.linear_velocity))
@@ -243,6 +259,7 @@ class ApproachSession:
             return
         self.samples = []
         self.missed_frames = 0
+        self.supervisor.reset()
         position = np.asarray(self.vehicle.state.position, dtype=np.float64)
         yaw = _yaw(self.vehicle.state.attitude)
         self.pole_xy = _next_pole(position[:2], self.pole_xy, yaw, np.random.default_rng())
@@ -380,6 +397,26 @@ class ApproachSession:
         # The charge is already at 100%. Restore the normal SITL floor so this
         # episode can discharge from full instead of staying locked at 100%.
         self._set_param("SIM_BAT_MIN_PCT", 50, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+
+    def _reject(self, reason):
+        print(f"Episode {self.episode + 1}: supervisor abort ({reason})")
+        self._set_abort_mode()
+        self._finish_episode(False, reason)
+
+    def _set_abort_mode(self):
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+            0,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            AUTO_MODE,
+            AUTO_RTL,
+            0,
+            0,
+            0,
+            0,
+        )
 
     def _set_land_mode(self):
         self.master.mav.command_long_send(
