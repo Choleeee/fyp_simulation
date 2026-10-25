@@ -72,16 +72,26 @@ def _depth_metres(depth):
     return depth
 
 
-def pole_visible(depth):
-    """True when a narrow vertical column stands out from both sides of the depth image."""
+def random_pole(vehicle_xy, yaw, rng):
+    """Pole position 3–5 m ahead of a heading, with up to 1 m of lateral offset."""
+    distance = float(rng.uniform(DISTANCE_MIN_M, DISTANCE_MAX_M))
+    lateral = float(rng.uniform(-LATERAL_MAX_M, LATERAL_MAX_M))
+    forward = np.array([np.cos(yaw), np.sin(yaw)])
+    left = np.array([-np.sin(yaw), np.cos(yaw)])
+    return np.asarray(vehicle_xy, dtype=np.float64) + distance * forward + lateral * left
+
+
+def column_observation(depth):
+    """Image column and range of the nearest narrow vertical column, or None."""
     depth = _depth_metres(depth)
     height, width = depth.shape
     if height < 16 or width < 32:
-        return False
+        return None
     body = depth[int(height * 0.05) : int(height * 0.75), :]
     column_min = body.min(axis=0)
     gap = max(6, width // 80)
     half = max(gap + 4, width // 16)
+    matches = []
     for x in range(half, width - half):
         near = float(column_min[x])
         if not 0.4 < near < 8.0:
@@ -92,8 +102,17 @@ def pole_visible(depth):
             continue
         column = body[:, max(0, x - 1) : x + 2]
         if float(np.mean(np.abs(column - near) < 0.5)) > 0.2:
-            return True
-    return False
+            matches.append((near, x))
+    if not matches:
+        return None
+    best_range = min(near for near, _ in matches)
+    chosen = [x for near, x in matches if near <= best_range + 0.05]
+    return int(np.median(chosen)), best_range
+
+
+def pole_visible(depth):
+    """True when a narrow vertical column stands out from both sides of the depth image."""
+    return column_observation(depth) is not None
 
 
 def downsample_depth(depth):

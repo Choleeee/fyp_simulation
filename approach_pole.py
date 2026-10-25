@@ -8,7 +8,7 @@ Close the MAVLink shell before running this; both listen on UDP port 14550.
 
 The pole in iris_pole.py is 3 m along world +X. PX4's local frame is
 north-east-down, and that direction is east, so the target is
-north = 0, east = 2.5 m, 3.0 m above the origin. If the vehicle flies
+north = 0, east = 2.5 m, 3 m above the origin. If the vehicle flies
 the wrong way, swap TARGET_NORTH_M and TARGET_EAST_M.
 """
 

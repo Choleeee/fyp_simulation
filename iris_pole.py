@@ -19,6 +19,13 @@ Fly the trained network, or record DAgger labels while it flies:
 
     isaac_run /path/to/iris_pole.py --rollout --episodes 5
     isaac_run /path/to/iris_pole.py --dagger --episodes 5
+
+Paired comparison. Draw the starts once, then fly each method on that list:
+
+    python3 starts.py --episodes 200 --seed 0
+    isaac_run /path/to/iris_pole.py --paired modular
+    isaac_run /path/to/iris_pole.py --paired policy
+    python3 compare_paired.py
 """
 
 import os
@@ -27,8 +34,11 @@ import sys
 
 def _consume_args(argv):
     mode = "scene"
+    method = None
     episodes = 5
+    episodes_given = False
     policy = os.path.join(os.path.dirname(os.path.abspath(__file__)), "policy.pt")
+    starts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "paired_starts.npz")
     kept = [argv[0]]
     index = 1
     while index < len(argv):
@@ -39,20 +49,38 @@ def _consume_args(argv):
             mode = "rollout"
         elif arg == "--dagger":
             mode = "dagger"
+        elif arg == "--paired" and index + 1 < len(argv):
+            mode = "paired"
+            index += 1
+            method = argv[index]
         elif arg == "--episodes" and index + 1 < len(argv):
             index += 1
             episodes = int(argv[index])
+            episodes_given = True
         elif arg == "--policy" and index + 1 < len(argv):
             index += 1
             policy = argv[index]
+        elif arg == "--starts" and index + 1 < len(argv):
+            index += 1
+            starts = argv[index]
         else:
             kept.append(arg)
         index += 1
-    return mode, episodes, policy, kept
+    if mode == "paired" and method not in ("policy", "modular"):
+        raise SystemExit("Use --paired policy or --paired modular.")
+    if mode == "paired" and not episodes_given:
+        episodes = None
+    return mode, episodes, policy, method, starts, kept
 
 
-MODE, EPISODES, POLICY_PATH, _KEPT = _consume_args(sys.argv)
+MODE, EPISODES, POLICY_PATH, PAIRED_METHOD, STARTS_PATH, _KEPT = _consume_args(sys.argv)
 sys.argv = _KEPT
+
+START_TABLE = None
+if MODE == "paired":
+    from starts import load_starts
+
+    START_TABLE = load_starts(STARTS_PATH)
 
 import carb
 from isaacsim import SimulationApp
@@ -299,6 +327,8 @@ class PegasusApp:
                 episodes=EPISODES,
                 policy_path=POLICY_PATH,
                 data_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
+                starts=START_TABLE,
+                method=PAIRED_METHOD,
             )
 
     def run(self):

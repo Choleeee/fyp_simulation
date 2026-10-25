@@ -6,6 +6,9 @@ half a metre short of the pole. If the column is outside the camera, the
 vehicle yaws in place until the depth image shows it, then approaches. It
 lands on that spot. The next pole is placed 3–5 m from the landing on a new
 heading, at least 60 degrees off the direction to the pole just reached.
+
+Paired mode ignores that chain. Each episode resets the vehicle to the origin
+and the pole to the matching row of the shared start file.
 """
 
 import os
@@ -18,19 +21,21 @@ from scipy.spatial.transform import Rotation
 import expert
 from supervisor import ApproachSupervisor, Command
 from task import (
+    ACTION_DIM,
     CAMERA_HFOV_DEG,
     CONTROL_PERIOD_S,
-    DISTANCE_MAX_M,
-    DISTANCE_MIN_M,
     EPISODE_TIMEOUT_S,
     KP_VERTICAL,
-    LATERAL_MAX_M,
+    OBS_HEIGHT,
+    OBS_WIDTH,
     POLE_HEIGHT_M,
+    STATE_DIM,
     TARGET_ALTITUDE_M,
     V_MAX_M_S,
     YAW_RATE_MAX_RAD_S,
     downsample_depth,
     pole_visible,
+    random_pole,
     wrap_angle,
 )
 
@@ -71,11 +76,13 @@ def _read_depth(camera_sensor):
 
 
 class ApproachSession:
-    def __init__(self, vehicle, pole, camera_sensor, mode, episodes, policy_path, data_dir):
+    def __init__(self, vehicle, pole, camera_sensor, mode, episodes, policy_path, data_dir, starts=None, method=None):
         self.vehicle = vehicle
         self.pole = pole
         self.camera_sensor = camera_sensor
         self.mode = mode
+        self.method = method
+        self.starts = starts
         self.episodes_requested = episodes
         self.policy_path = policy_path
         self.data_dir = data_dir
@@ -92,8 +99,22 @@ class ApproachSession:
         self.supervisor = ApproachSupervisor()
         self.done = False
         self._status_time = 0.0
+        self.takeoff_ned = None
+        self._pose_prim = None
+        self._start_xy = np.zeros(2)
+        self._start_yaw = 0.0
 
-        if mode in ("rollout", "dagger"):
+        if mode == "paired":
+            if starts is None or method not in ("policy", "modular"):
+                raise SystemExit("Paired mode needs a start table and method 'policy' or 'modular'.")
+            self.episodes_requested = len(starts["yaw"]) if episodes is None else min(int(episodes), len(starts["yaw"]))
+            self.episode = self._first_missing_pair()
+            seed = int(np.asarray(starts["seed"]).reshape(-1)[0])
+            print(
+                f"Paired {method}, {self.episodes_requested} starts, seed {seed}, "
+                f"resuming at pair {self.episode + 1}"
+            )
+        if mode in ("rollout", "dagger") or (mode == "paired" and method == "policy"):
             if not os.path.isfile(policy_path):
                 raise SystemExit(f"Missing {policy_path}. Run train_policy.py after collecting episodes.")
             from policy_net import load_policy
@@ -117,6 +138,24 @@ class ApproachSession:
             if now - self.phase_started > 3.0:
                 self._begin_episode()
             return
+        if self.phase == "place":
+            # Pin the saved start every step. One write is not enough: the
+            # physics step moves the body again before PX4 is disarmed.
+            self._pin_vehicle(self._start_xy, self._start_yaw)
+            if self.master is not None and now - self.phase_started > 0.5:
+                self._arm(disarm=True)
+            if now - self.phase_started > 3.0:
+                position = np.asarray(self.vehicle.state.position, dtype=np.float64)
+                yaw = _yaw(self.vehicle.state.attitude)
+                print(
+                    f"Pair {self.episode + 1}: reset to x={float(position[0]):.2f} "
+                    f"y={float(position[1]):.2f} yaw={yaw:.2f} (start yaw {self._start_yaw:.2f}), "
+                    f"pole at x={self.pole_xy[0]:.2f} y={self.pole_xy[1]:.2f}"
+                )
+                self.phase = "recharge"
+                self.phase_started = now
+                self.last_command = 0.0
+            return
         if self.phase == "recharge":
             if now - self.last_command >= 0.2:
                 self.last_command = now
@@ -135,7 +174,7 @@ class ApproachSession:
         yaw = _yaw(self.vehicle.state.attitude)
         expert_action = expert.command(position, yaw, self.pole_xy)
         state = _body_state(self.vehicle.state)
-        action = self._select_action(expert_action, state)
+        action = self._select_action(expert_action, state, position, yaw)
 
         if self.phase == "stream":
             self._send(action)
@@ -168,7 +207,7 @@ class ApproachSession:
 
         if self.phase == "takeoff":
             # A body-up velocity never settles: it is still climbing when the
-            # height check becomes true. A position setpoint holds 3.0 m.
+            # height check becomes true. A position setpoint holds the approach altitude.
             self._set_offboard()
             self._command_climb(position)
             height_error = abs(float(position[2]) - TARGET_ALTITUDE_M)
@@ -190,7 +229,7 @@ class ApproachSession:
 
         if self.phase == "fly":
             depth = _read_depth(self.camera_sensor)
-            if not _pole_detected(position, yaw, self.pole_xy, depth):
+            if self.mode != "paired" and not _pole_detected(position, yaw, self.pole_xy, depth):
                 action = _yaw_search(position, yaw, self.pole_xy)
                 if not self.searching:
                     self.searching = True
@@ -260,6 +299,17 @@ class ApproachSession:
         self.samples = []
         self.missed_frames = 0
         self.supervisor.reset()
+        self.takeoff_ned = None
+        if self.mode == "paired":
+            self._start_xy = np.asarray(self.starts["vehicle_xy"][self.episode], dtype=np.float64)
+            self._start_yaw = float(self.starts["yaw"][self.episode])
+            self.pole_xy = np.asarray(self.starts["pole_xy"][self.episode], dtype=np.float64)
+            self.pole.set_world_pose(position=np.array([self.pole_xy[0], self.pole_xy[1], POLE_HEIGHT_M / 2.0]))
+            self._pin_vehicle(self._start_xy, self._start_yaw)
+            self.phase = "place"
+            self.phase_started = time.monotonic()
+            self.last_command = 0.0
+            return
         position = np.asarray(self.vehicle.state.position, dtype=np.float64)
         yaw = _yaw(self.vehicle.state.attitude)
         self.pole_xy = _next_pole(position[:2], self.pole_xy, yaw, np.random.default_rng())
@@ -268,11 +318,19 @@ class ApproachSession:
         self.phase_started = time.monotonic()
         self.last_command = 0.0
 
-    def _select_action(self, expert_action, state):
+    def _select_action(self, expert_action, state, position, yaw):
+        if self.mode == "paired" and self.method == "modular":
+            import modular
+
+            return modular.command(_read_depth(self.camera_sensor), position, yaw)
         if self.mode == "collect" or self.policy is None:
             return expert_action
         depth = _read_depth(self.camera_sensor)
         if depth is None:
+            if self.mode == "paired":
+                import modular
+
+                return modular.hold_altitude(position)
             return expert_action
         from policy_net import predict
 
@@ -289,7 +347,7 @@ class ApproachSession:
             observation = np.clip(observation + noise, 0.0, 1.0)
         # Collect and DAgger store the expert command as the label.
         # Rollout stores the command the policy actually sent.
-        label = executed_action if self.mode == "rollout" else expert_action
+        label = executed_action if self.mode in ("rollout", "paired") else expert_action
         self.samples.append((observation, state, label))
 
     def _finish_episode(self, success, reason):
@@ -301,6 +359,9 @@ class ApproachSession:
         self.phase_started = time.monotonic()
 
     def _save(self, success, reason):
+        if self.mode == "paired":
+            self._save_pair(success, reason)
+            return
         if not self.samples:
             print(
                 f"Episode {self.episode + 1} recorded no camera frames ({reason}, "
@@ -321,6 +382,56 @@ class ApproachSession:
         )
         missed = f", camera missed {self.missed_frames} steps" if self.missed_frames else ""
         print(f"Saved {len(self.samples)} samples to {path} ({reason}{missed})")
+
+    def _save_pair(self, success, reason):
+        os.makedirs(self.data_dir, exist_ok=True)
+        path = self._pair_path(self.episode)
+        if self.samples:
+            depth, state, action = map(np.stack, zip(*self.samples))
+        else:
+            depth = np.zeros((0, OBS_HEIGHT, OBS_WIDTH), dtype=np.float32)
+            state = np.zeros((0, STATE_DIM), dtype=np.float32)
+            action = np.zeros((0, ACTION_DIM), dtype=np.float32)
+        smoothness = float("nan")
+        if len(action) >= 2:
+            smoothness = float(np.abs(np.diff(np.asarray(action, dtype=np.float64), axis=0)).mean())
+        np.savez_compressed(
+            path,
+            depth=np.asarray(depth).astype(np.float16),
+            state=np.asarray(state).astype(np.float32),
+            action=np.asarray(action).astype(np.float32),
+            success=np.array([success]),
+            reason=np.array(reason),
+            pair=np.array(self.episode),
+            method=np.array(self.method),
+            time_s=np.array(len(action) * CONTROL_PERIOD_S),
+            smoothness=np.array(smoothness),
+        )
+        print(f"Saved pair {self.episode + 1} to {path} ({reason}, {len(action) * CONTROL_PERIOD_S:.1f} s)")
+
+    def _pair_path(self, index):
+        return os.path.join(self.data_dir, f"paired_{self.method}_{int(index):04d}.npz")
+
+    def _first_missing_pair(self):
+        for index in range(self.episodes_requested):
+            if not os.path.isfile(self._pair_path(index)):
+                return index
+        return self.episodes_requested
+
+    def _pin_vehicle(self, xy, yaw):
+        from omni.isaac.core.prims import XFormPrim
+
+        quat_xyzw = Rotation.from_euler("ZYX", [float(yaw), 0.0, 0.0]).as_quat()
+        quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=np.float64)
+        if self._pose_prim is None:
+            try:
+                self._pose_prim = XFormPrim(prim_path="/World/quadrotor", reset_xform_properties=False)
+            except TypeError:
+                self._pose_prim = XFormPrim(prim_path="/World/quadrotor")
+        self._pose_prim.set_world_pose(
+            position=np.array([float(xy[0]), float(xy[1]), 0.07], dtype=np.float64),
+            orientation=quat_wxyz,
+        )
 
     def _command_climb(self, position):
         if self.takeoff_ned is None:
@@ -474,6 +585,10 @@ class ApproachSession:
             self._arm(disarm=True)
         self.done = True
         print(f"Finished {self.episode} episodes")
+        if self.mode == "paired":
+            from compare_paired import report
+
+            report(self.data_dir)
 
 
 def _view_error(position, yaw, pole_xy):
@@ -504,14 +619,6 @@ def _yaw_search(position, yaw, pole_xy):
     return np.array([0.0, 0.0, up, direction * YAW_RATE_MAX_RAD_S], dtype=np.float32)
 
 
-def _random_pole(vehicle_xy, yaw, rng):
-    distance = float(rng.uniform(DISTANCE_MIN_M, DISTANCE_MAX_M))
-    lateral = float(rng.uniform(-LATERAL_MAX_M, LATERAL_MAX_M))
-    forward = np.array([np.cos(yaw), np.sin(yaw)])
-    left = np.array([-np.sin(yaw), np.cos(yaw)])
-    return np.asarray(vehicle_xy, dtype=np.float64) + distance * forward + lateral * left
-
-
 def _next_pole(vehicle_xy, pole_xy, yaw, rng):
     """Place the next pole from the landing, on a heading that is not straight ahead."""
     vehicle_xy = np.asarray(vehicle_xy, dtype=np.float64)
@@ -521,4 +628,4 @@ def _next_pole(vehicle_xy, pole_xy, yaw, rng):
     else:
         previous = float(np.arctan2(to_pole[1], to_pole[0]))
     turn = float(rng.choice([-1.0, 1.0]) * rng.uniform(np.pi / 3, np.pi))
-    return _random_pole(vehicle_xy, previous + turn, rng)
+    return random_pole(vehicle_xy, previous + turn, rng)
