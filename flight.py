@@ -7,8 +7,8 @@ vehicle yaws in place until the depth image shows it, then approaches. It
 lands on that spot. The next pole is placed 3–5 m from the landing on a new
 heading, at least 60 degrees off the direction to the pole just reached.
 
-Paired mode ignores that chain. Each episode resets the vehicle to the origin
-and the pole to the matching row of the shared start file.
+Paired mode ignores that chain. The vehicle stays where it landed. The pole is
+moved so the distance and the bearing match the shared start.
 """
 
 import os
@@ -100,9 +100,6 @@ class ApproachSession:
         self.done = False
         self._status_time = 0.0
         self.takeoff_ned = None
-        self._pose_prim = None
-        self._start_xy = np.zeros(2)
-        self._start_yaw = 0.0
 
         if mode == "paired":
             if starts is None or method not in ("policy", "modular"):
@@ -137,24 +134,6 @@ class ApproachSession:
                 self._recharge_battery()
             if now - self.phase_started > 3.0:
                 self._begin_episode()
-            return
-        if self.phase == "place":
-            # Pin the saved start every step. One write is not enough: the
-            # physics step moves the body again before PX4 is disarmed.
-            self._pin_vehicle(self._start_xy, self._start_yaw)
-            if self.master is not None and now - self.phase_started > 0.5:
-                self._arm(disarm=True)
-            if now - self.phase_started > 3.0:
-                position = np.asarray(self.vehicle.state.position, dtype=np.float64)
-                yaw = _yaw(self.vehicle.state.attitude)
-                print(
-                    f"Pair {self.episode + 1}: reset to x={float(position[0]):.2f} "
-                    f"y={float(position[1]):.2f} yaw={yaw:.2f} (start yaw {self._start_yaw:.2f}), "
-                    f"pole at x={self.pole_xy[0]:.2f} y={self.pole_xy[1]:.2f}"
-                )
-                self.phase = "recharge"
-                self.phase_started = now
-                self.last_command = 0.0
             return
         if self.phase == "recharge":
             if now - self.last_command >= 0.2:
@@ -301,12 +280,25 @@ class ApproachSession:
         self.supervisor.reset()
         self.takeoff_ned = None
         if self.mode == "paired":
-            self._start_xy = np.asarray(self.starts["vehicle_xy"][self.episode], dtype=np.float64)
-            self._start_yaw = float(self.starts["yaw"][self.episode])
-            self.pole_xy = np.asarray(self.starts["pole_xy"][self.episode], dtype=np.float64)
+            from starts import pole_from_vehicle
+
+            position = np.asarray(self.vehicle.state.position, dtype=np.float64)
+            yaw = _yaw(self.vehicle.state.attitude)
+            self.pole_xy = pole_from_vehicle(
+                self.starts["vehicle_xy"][self.episode],
+                self.starts["yaw"][self.episode],
+                self.starts["pole_xy"][self.episode],
+                position[:2],
+                yaw,
+            )
             self.pole.set_world_pose(position=np.array([self.pole_xy[0], self.pole_xy[1], POLE_HEIGHT_M / 2.0]))
-            self._pin_vehicle(self._start_xy, self._start_yaw)
-            self.phase = "place"
+            distance = float(np.linalg.norm(self.pole_xy - position[:2]))
+            print(
+                f"Pair {self.episode + 1}: vehicle stays at x={float(position[0]):.2f} "
+                f"y={float(position[1]):.2f} yaw={yaw:.2f}, "
+                f"pole at x={self.pole_xy[0]:.2f} y={self.pole_xy[1]:.2f} ({distance:.2f} m)"
+            )
+            self.phase = "recharge"
             self.phase_started = time.monotonic()
             self.last_command = 0.0
             return
@@ -417,21 +409,6 @@ class ApproachSession:
             if not os.path.isfile(self._pair_path(index)):
                 return index
         return self.episodes_requested
-
-    def _pin_vehicle(self, xy, yaw):
-        from omni.isaac.core.prims import XFormPrim
-
-        quat_xyzw = Rotation.from_euler("ZYX", [float(yaw), 0.0, 0.0]).as_quat()
-        quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=np.float64)
-        if self._pose_prim is None:
-            try:
-                self._pose_prim = XFormPrim(prim_path="/World/quadrotor", reset_xform_properties=False)
-            except TypeError:
-                self._pose_prim = XFormPrim(prim_path="/World/quadrotor")
-        self._pose_prim.set_world_pose(
-            position=np.array([float(xy[0]), float(xy[1]), 0.07], dtype=np.float64),
-            orientation=quat_wxyz,
-        )
 
     def _command_climb(self, position):
         if self.takeoff_ned is None:

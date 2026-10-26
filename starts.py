@@ -39,6 +39,18 @@ def save_starts(path, table):
     np.savez_compressed(path, **table)
 
 
+def pole_from_vehicle(start_vehicle_xy, start_yaw, start_pole_xy, vehicle_xy, yaw):
+    """Place the saved pole relative to the vehicle, without moving the vehicle."""
+    delta = np.asarray(start_pole_xy, dtype=np.float64) - np.asarray(start_vehicle_xy, dtype=np.float64)
+    start_yaw = float(start_yaw)
+    forward = float(np.cos(start_yaw) * delta[0] + np.sin(start_yaw) * delta[1])
+    left = float(-np.sin(start_yaw) * delta[0] + np.cos(start_yaw) * delta[1])
+    yaw = float(yaw)
+    forward_axis = np.array([np.cos(yaw), np.sin(yaw)])
+    left_axis = np.array([-np.sin(yaw), np.cos(yaw)])
+    return np.asarray(vehicle_xy, dtype=np.float64) + forward * forward_axis + left * left_axis
+
+
 def load_starts(path):
     if not os.path.isfile(path):
         raise SystemExit(
