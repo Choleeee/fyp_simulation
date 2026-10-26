@@ -40,7 +40,7 @@ def save_starts(path, table):
 
 
 def pole_from_vehicle(start_vehicle_xy, start_yaw, start_pole_xy, vehicle_xy, yaw):
-    """Place the saved pole relative to the vehicle, without moving the vehicle."""
+    """Saved pole, expressed relative to wherever the vehicle is now."""
     delta = np.asarray(start_pole_xy, dtype=np.float64) - np.asarray(start_vehicle_xy, dtype=np.float64)
     start_yaw = float(start_yaw)
     forward = float(np.cos(start_yaw) * delta[0] + np.sin(start_yaw) * delta[1])
@@ -49,6 +49,20 @@ def pole_from_vehicle(start_vehicle_xy, start_yaw, start_pole_xy, vehicle_xy, ya
     forward_axis = np.array([np.cos(yaw), np.sin(yaw)])
     left_axis = np.array([-np.sin(yaw), np.cos(yaw)])
     return np.asarray(vehicle_xy, dtype=np.float64) + forward * forward_axis + left * left_axis
+
+
+def pole_at_radius(start_vehicle_xy, start_yaw, start_pole_xy, vehicle_xy, yaw):
+    """Same bearing as the saved start, with the distance held inside 3–5 m."""
+    from task import DISTANCE_MAX_M, DISTANCE_MIN_M
+
+    vehicle_xy = np.asarray(vehicle_xy, dtype=np.float64)
+    delta = pole_from_vehicle(start_vehicle_xy, start_yaw, start_pole_xy, vehicle_xy, yaw) - vehicle_xy
+    radius = float(np.linalg.norm(delta))
+    if radius < 1e-6:
+        delta = np.array([DISTANCE_MIN_M, 0.0])
+        radius = DISTANCE_MIN_M
+    desired = float(np.clip(radius, DISTANCE_MIN_M, DISTANCE_MAX_M))
+    return vehicle_xy + delta * (desired / radius)
 
 
 def load_starts(path):

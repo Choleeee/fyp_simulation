@@ -8,7 +8,7 @@ import numpy as np
 
 from compare_paired import command_smoothness, load_method, report
 from modular import command, estimate_pole_xy
-from starts import generate_starts, pole_from_vehicle
+from starts import generate_starts, pole_at_radius, pole_from_vehicle
 from task import CAMERA_HEIGHT, CAMERA_WIDTH, YAW_RATE_MAX_RAD_S, column_observation, pole_visible
 
 
@@ -26,15 +26,15 @@ def main():
     assert np.allclose(first["yaw"], second["yaw"])
     other = generate_starts(200, 1)
     assert not np.allclose(first["pole_xy"], other["pole_xy"])
-    offset = first["pole_xy"] - first["vehicle_xy"]
-    distance = np.linalg.norm(offset, axis=1)
-    assert np.all((distance >= 3.0 - 1e-6) & (distance <= np.hypot(5.0, 1.0) + 1e-6))
+    distance = np.linalg.norm(first["pole_xy"] - first["vehicle_xy"], axis=1)
+    assert np.all((distance >= 3.0 - 1e-6) & (distance <= 5.0 + 1e-6))
     print("pass  shared starts are reproducible")
 
     moved = pole_from_vehicle([0.0, 0.0], 0.0, [4.0, 0.5], [1.0, 2.0], np.pi / 2.0)
     assert np.allclose(moved, [0.5, 6.0])
-    assert abs(np.linalg.norm(moved - [1.0, 2.0]) - np.hypot(4.0, 0.5)) < 1e-6
-    print("pass  pole follows the vehicle without moving it")
+    placed = pole_at_radius([0.0, 0.0], 0.0, [6.0, 0.0], [0.0, 0.0], 0.0)
+    assert abs(np.linalg.norm(placed) - 5.0) < 1e-6
+    print("pass  pole stays on a 3–5 m radius")
 
     depth = _column_image(CAMERA_WIDTH // 2, 4.0)
     assert pole_visible(depth)

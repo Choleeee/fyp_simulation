@@ -7,8 +7,9 @@ vehicle yaws in place until the depth image shows it, then approaches. It
 lands on that spot. The next pole is placed 3–5 m from the landing on a new
 heading, at least 60 degrees off the direction to the pole just reached.
 
-Paired mode ignores that chain. The vehicle stays where it landed. The pole is
-moved so the distance and the bearing match the shared start.
+After each landing the vehicle flies back to the origin and lands there. The
+next pole is placed on a 3–5 m radius from that point, so a long run stays
+inside the geofence. Paired episodes keep the saved bearing.
 """
 
 import os
@@ -101,6 +102,7 @@ class ApproachSession:
         self._status_time = 0.0
         self.takeoff_ned = None
         self._last_fly_tick = None
+        self._return_step = None
 
         if mode == "paired":
             if starts is None or method not in ("policy", "modular"):
@@ -252,8 +254,11 @@ class ApproachSession:
             self._set_land_mode()
             landed = position[2] < 0.25 and not self._armed()
             if landed or now - self.phase_started > 25.0:
-                self.phase = "between"
-                self.phase_started = now
+                self._start_return(position, now)
+            return
+
+        if self.phase == "return":
+            self._return_home(position, now)
             return
 
         if self.phase == "between" and now - self.phase_started > 2.0:
@@ -288,11 +293,11 @@ class ApproachSession:
         self.takeoff_ned = None
         self._last_fly_tick = None
         if self.mode == "paired":
-            from starts import pole_from_vehicle
+            from starts import pole_at_radius
 
             position = np.asarray(self.vehicle.state.position, dtype=np.float64)
             yaw = _yaw(self.vehicle.state.attitude)
-            self.pole_xy = pole_from_vehicle(
+            self.pole_xy = pole_at_radius(
                 self.starts["vehicle_xy"][self.episode],
                 self.starts["yaw"][self.episode],
                 self.starts["pole_xy"][self.episode],
@@ -302,7 +307,7 @@ class ApproachSession:
             self.pole.set_world_pose(position=np.array([self.pole_xy[0], self.pole_xy[1], POLE_HEIGHT_M / 2.0]))
             distance = float(np.linalg.norm(self.pole_xy - position[:2]))
             print(
-                f"Pair {self.episode + 1}: vehicle stays at x={float(position[0]):.2f} "
+                f"Pair {self.episode + 1}: vehicle at x={float(position[0]):.2f} "
                 f"y={float(position[1]):.2f} yaw={yaw:.2f}, "
                 f"pole at x={self.pole_xy[0]:.2f} y={self.pole_xy[1]:.2f} ({distance:.2f} m)"
             )
@@ -417,6 +422,111 @@ class ApproachSession:
             if not os.path.isfile(self._pair_path(index)):
                 return index
         return self.episodes_requested
+
+    def _start_return(self, position, now):
+        if float(np.hypot(position[0], position[1])) <= 0.8:
+            self.phase = "between"
+            self.phase_started = now
+            return
+        print(
+            f"Returning to the origin from x={float(position[0]):.2f} y={float(position[1]):.2f}"
+        )
+        self.phase = "return"
+        self._return_step = "stream"
+        self.takeoff_ned = None
+        self.phase_started = now
+        self.last_command = now
+
+    def _return_home(self, position, now):
+        """Fly back to the origin and land. The estimator is not teleported."""
+        horizontal = float(np.hypot(position[0], position[1]))
+        if self._return_step == "stream":
+            self._send(np.zeros(4, dtype=np.float32))
+            if now - self.phase_started > 1.0:
+                self._set_offboard()
+                self._arm(force=False)
+                self._return_step = "arm"
+                self.phase_started = now
+            return
+        if self._return_step == "arm":
+            self._send(np.zeros(4, dtype=np.float32))
+            self._arm(force=now - self.phase_started > 3.0)
+            if self._armed():
+                self._set_offboard()
+                self.takeoff_ned = None
+                self._return_step = "climb"
+                self.phase_started = now
+            elif now - self.phase_started > 12.0:
+                print(
+                    f"Could not arm for the return. Next pole is placed from "
+                    f"x={float(position[0]):.2f} y={float(position[1]):.2f}"
+                )
+                self.phase = "between"
+                self.phase_started = now
+            return
+        if self._return_step == "climb":
+            self._set_offboard()
+            self._command_climb(position)
+            if abs(float(position[2]) - TARGET_ALTITUDE_M) < 0.4 or now - self.phase_started > 30.0:
+                self._return_step = "fly"
+                self.phase_started = now
+            return
+        if self._return_step == "fly":
+            self._set_offboard()
+            self._command_origin(position)
+            speed = float(np.linalg.norm(self.vehicle.state.linear_velocity))
+            if (horizontal < 0.8 and speed < 0.4) or now - self.phase_started > 90.0:
+                if horizontal >= 0.8:
+                    print(
+                        f"Return stopped at x={float(position[0]):.2f} y={float(position[1]):.2f}"
+                    )
+                self._return_step = "land"
+                self.phase_started = now
+            return
+        self._set_land_mode()
+        if (float(position[2]) < 0.25 and not self._armed()) or now - self.phase_started > 25.0:
+            self.phase = "between"
+            self.phase_started = now
+
+    def _command_origin(self, position):
+        """Position setpoint for Isaac (0, 0) at the approach altitude."""
+        local = self.master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
+        if local is None:
+            direction = -np.asarray(position[:2], dtype=np.float64)
+            norm = float(np.linalg.norm(direction))
+            yaw = _yaw(self.vehicle.state.attitude)
+            if norm < 1e-3:
+                body = np.zeros(2)
+            else:
+                # Isaac x is east and y is north. Body forward is the yaw axis.
+                world = 0.5 * direction / norm
+                forward = float(world[0] * np.cos(yaw) + world[1] * np.sin(yaw))
+                left = float(-world[0] * np.sin(yaw) + world[1] * np.cos(yaw))
+                body = np.array([forward, left])
+            self._send(np.array([body[0], body[1], 0.0, 0.0], dtype=np.float32))
+            return
+        # PX4 local x is north, which is Isaac y. Local y is east, which is Isaac x.
+        north = float(local.x) + (0.0 - float(position[1]))
+        east = float(local.y) + (0.0 - float(position[0]))
+        down = float(local.z) - (TARGET_ALTITUDE_M - float(position[2]))
+        self.master.mav.set_position_target_local_ned_send(
+            0,
+            self.master.target_system,
+            self.master.target_component,
+            LOCAL_NED,
+            POSITION_MASK,
+            north,
+            east,
+            down,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
 
     def _command_climb(self, position):
         if self.takeoff_ned is None:

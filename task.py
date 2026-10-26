@@ -73,12 +73,10 @@ def _depth_metres(depth):
 
 
 def random_pole(vehicle_xy, yaw, rng):
-    """Pole position 3–5 m ahead of a heading, with up to 1 m of lateral offset."""
-    distance = float(rng.uniform(DISTANCE_MIN_M, DISTANCE_MAX_M))
-    lateral = float(rng.uniform(-LATERAL_MAX_M, LATERAL_MAX_M))
-    forward = np.array([np.cos(yaw), np.sin(yaw)])
-    left = np.array([-np.sin(yaw), np.cos(yaw)])
-    return np.asarray(vehicle_xy, dtype=np.float64) + distance * forward + lateral * left
+    """Pole position on a 3–5 m radius from the vehicle, along the given heading."""
+    radius = float(rng.uniform(DISTANCE_MIN_M, DISTANCE_MAX_M))
+    direction = np.array([np.cos(float(yaw)), np.sin(float(yaw))])
+    return np.asarray(vehicle_xy, dtype=np.float64) + radius * direction
 
 
 def column_observation(depth):
