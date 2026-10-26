@@ -78,6 +78,12 @@ def main():
     results.append(check("dropout", stopped, dropout.reason, False, "dropout"))
     results.append(check("stream still alive at 0.1 s", alive, None, True))
 
+    stalled = ApproachSupervisor()
+    stalled.evaluate(Command(0.2, 0.0, 0.0, 0.0, now), np.array([0.0, 0.0, 1.5]), 0.0, POLE, now)
+    stalled.resume(now + 2.0)
+    ok = stalled.poll(now + 2.0)
+    results.append(check("simulator pause is not a dropout", ok, stalled.reason, True))
+
     if not all(results):
         raise SystemExit(1)
     print(f"{len(results)} checks passed")

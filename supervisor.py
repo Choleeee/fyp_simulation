@@ -70,6 +70,12 @@ class ApproachSupervisor:
         self._streaming = True
         return True
 
+    def resume(self, now):
+        """The caller was paused. A pause is not a stopped command stream."""
+        if self.aborted or not self._streaming:
+            return
+        self._last_accept = float(now)
+
     def poll(self, now):
         """Abort when a started stream has stopped."""
         if self.aborted or not self._streaming or self._last_accept is None:

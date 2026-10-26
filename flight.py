@@ -19,7 +19,7 @@ from pymavlink import mavutil
 from scipy.spatial.transform import Rotation
 
 import expert
-from supervisor import ApproachSupervisor, Command
+from supervisor import DROPOUT_S, ApproachSupervisor, Command
 from task import (
     ACTION_DIM,
     CAMERA_HFOV_DEG,
@@ -100,6 +100,7 @@ class ApproachSession:
         self.done = False
         self._status_time = 0.0
         self.takeoff_ned = None
+        self._last_fly_tick = None
 
         if mode == "paired":
             if starts is None or method not in ("policy", "modular"):
@@ -216,6 +217,12 @@ class ApproachSession:
             elif self.searching:
                 self.searching = False
                 print(f"Episode {self.episode + 1}: pole in the camera view")
+            # A gap longer than one missed setpoint means Isaac stopped
+            # stepping. PX4 then prints "simulator_mavlink poll timeout".
+            # That pause is not a command dropout.
+            if self._last_fly_tick is not None and now - self._last_fly_tick > DROPOUT_S:
+                self.supervisor.resume(now)
+            self._last_fly_tick = now
             if not self.supervisor.poll(now):
                 self._reject(self.supervisor.reason)
                 return
@@ -279,6 +286,7 @@ class ApproachSession:
         self.missed_frames = 0
         self.supervisor.reset()
         self.takeoff_ned = None
+        self._last_fly_tick = None
         if self.mode == "paired":
             from starts import pole_from_vehicle
 
