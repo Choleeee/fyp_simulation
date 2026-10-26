@@ -10,6 +10,11 @@ heading, at least 60 degrees off the direction to the pole just reached.
 After each landing the vehicle flies back to the origin and lands there. The
 next pole is placed on a 3–5 m radius from that point, so a long run stays
 inside the geofence. Paired episodes keep the saved bearing.
+
+A timed-out or aborted episode descends in offboard and the next episode
+starts only after the vehicle is disarmed on the ground. Return-to-launch is
+not used: that mode climbs far above the room and the following episodes then
+time out while it is still active.
 """
 
 import os
@@ -41,9 +46,6 @@ from task import (
 )
 
 OFFBOARD_MODE = 6
-AUTO_MODE = 4
-AUTO_RTL = 5
-AUTO_LAND = 6
 # Ignore position, acceleration, and yaw. Use body velocity and yaw rate.
 VELOCITY_MASK = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10)
 # Ignore velocity, acceleration, yaw, and yaw rate. Use local position.
@@ -103,6 +105,7 @@ class ApproachSession:
         self.takeoff_ned = None
         self._last_fly_tick = None
         self._return_step = None
+        self._armed_state = True
 
         if mode == "paired":
             if starts is None or method not in ("policy", "modular"):
@@ -238,7 +241,10 @@ class ApproachSession:
             if not allowed:
                 self._reject(self.supervisor.reason)
                 return
+            # Re-enter offboard after a stall. Otherwise PX4 stays in the
+            # failsafe it selected when the setpoint stream paused.
             self._send(action)
+            self._set_offboard()
             self._record(state, action, expert_action)
             speed = float(np.linalg.norm(self.vehicle.state.linear_velocity))
             elapsed = now - self.phase_started
@@ -251,9 +257,7 @@ class ApproachSession:
             return
 
         if self.phase == "land":
-            self._set_land_mode()
-            landed = position[2] < 0.25 and not self._armed()
-            if landed or now - self.phase_started > 25.0:
+            if self._descend_and_disarm(position, now):
                 self._start_return(position, now)
             return
 
@@ -358,8 +362,8 @@ class ApproachSession:
     def _finish_episode(self, success, reason):
         self._save(success, reason)
         self.episode += 1
-        # Descend at the staging point. The landing is not part of the demonstration.
-        self._set_land_mode()
+        # The landing is not part of the demonstration. Stay in offboard and
+        # descend; the next episode waits until the vehicle is disarmed.
         self.phase = "land"
         self.phase_started = time.monotonic()
 
@@ -483,8 +487,7 @@ class ApproachSession:
                 self._return_step = "land"
                 self.phase_started = now
             return
-        self._set_land_mode()
-        if (float(position[2]) < 0.25 and not self._armed()) or now - self.phase_started > 25.0:
+        if self._descend_and_disarm(position, now):
             self.phase = "between"
             self.phase_started = now
 
@@ -598,6 +601,10 @@ class ApproachSession:
         # on its own between episodes.
         self._set_param("SIM_BAT_MIN_PCT", 100, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
         self._set_param("COM_LOW_BAT_ACT", 0, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
+        # Offboard loss lands in place. Action 3 is return-to-launch, which
+        # climbs to a home altitude above this room. 4 is land.
+        self._set_param("COM_OBL_RC_ACT", 4, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
+        self._set_param("COM_OF_LOSS_T", 5.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
 
     def _release_battery_floor(self):
         # The charge is already at 100%. Restore the normal SITL floor so this
@@ -606,38 +613,25 @@ class ApproachSession:
 
     def _reject(self, reason):
         print(f"Episode {self.episode + 1}: supervisor abort ({reason})")
-        self._set_abort_mode()
         self._finish_episode(False, reason)
 
-    def _set_abort_mode(self):
-        self.master.mav.command_long_send(
-            self.master.target_system,
-            self.master.target_component,
-            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-            0,
-            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-            AUTO_MODE,
-            AUTO_RTL,
-            0,
-            0,
-            0,
-            0,
-        )
+    def _descend_and_disarm(self, position, now):
+        """True once the vehicle is disarmed on the ground.
 
-    def _set_land_mode(self):
-        self.master.mav.command_long_send(
-            self.master.target_system,
-            self.master.target_component,
-            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-            0,
-            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-            AUTO_MODE,
-            AUTO_LAND,
-            0,
-            0,
-            0,
-            0,
-        )
+        Setpoints keep streaming, so a paused simulator is not followed by a
+        return-to-launch climb. The next episode is not started in the air.
+        """
+        height = float(position[2])
+        downward = -0.4 if height > 0.35 else -0.15
+        self._send(np.array([0.0, 0.0, downward, 0.0], dtype=np.float32))
+        self._set_offboard()
+        if height < 0.35:
+            self._arm(force=True, disarm=True)
+        landed = height < 0.25 and not self._armed()
+        if not landed and now - self.phase_started > 45.0 and now - self._status_time > 10.0:
+            self._status_time = now
+            print(f"Still landing from z={height:.2f}")
+        return landed
 
     def _set_offboard(self):
         self.master.mav.command_long_send(
@@ -661,7 +655,7 @@ class ApproachSession:
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0,
             0 if disarm else 1,
-            21196 if force and not disarm else 0,
+            21196 if force else 0,
             0,
             0,
             0,
@@ -671,9 +665,9 @@ class ApproachSession:
 
     def _armed(self):
         heartbeat = self.master.recv_match(type="HEARTBEAT", blocking=False)
-        if heartbeat is None:
-            return False
-        return bool(heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+        if heartbeat is not None:
+            self._armed_state = bool(heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+        return self._armed_state
 
     def _disarm_and_stop(self):
         if self.master is not None:
