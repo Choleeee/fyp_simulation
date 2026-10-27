@@ -157,6 +157,10 @@ class ApproachSession:
             if now - self.last_command >= 0.2:
                 self.last_command = now
                 self._recharge_battery()
+                # Keep a still setpoint so a failed arm does not become an
+                # offboard-loss failsafe before the next attempt.
+                self._send(np.zeros(4, dtype=np.float32))
+                self._set_position_mode()
             if now - self.phase_started > 1.0:
                 self._release_battery_floor()
                 print(f"Episode {self.episode + 1}: battery recharged")
@@ -174,7 +178,9 @@ class ApproachSession:
         action = self._select_action(expert_action, state, position, yaw)
 
         if self.phase == "stream":
-            self._send(action)
+            # The approach command starts only after takeoff. A policy command
+            # on the ground is what makes the next arm fail.
+            self._send(np.zeros(4, dtype=np.float32))
             if now - self.phase_started < 0.2:
                 self._set_position_mode()
             if now - self.phase_started > 1.0:
@@ -189,7 +195,7 @@ class ApproachSession:
             # The first boot rejects offboard until the position estimate
             # exists. Arming before that leaves the vehicle in position mode,
             # and the climb setpoints never leave the ground.
-            self._send(action)
+            self._send(np.zeros(4, dtype=np.float32))
             self._set_offboard()
             if not self._offboard_active():
                 self._offboard_since = None
@@ -306,8 +312,15 @@ class ApproachSession:
             self._return_home(position, now)
             return
 
-        if self.phase == "between" and now - self.phase_started > 2.0:
-            self._begin_episode()
+        if self.phase == "between":
+            self._send(np.zeros(4, dtype=np.float32))
+            self._set_position_mode()
+            if self._armed():
+                self._arm(force=True, disarm=True)
+            settled = (not self._armed()) and not self._offboard_active()
+            if (settled and now - self.phase_started > 2.0) or now - self.phase_started > 8.0:
+                self._begin_episode()
+            return
 
     def _connect(self):
         now = time.monotonic()
