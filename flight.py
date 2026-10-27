@@ -115,6 +115,7 @@ class ApproachSession:
         self._local_position = None
         self._hold_ned = None
         self._offboard_since = None
+        self._arm_noted = False
         self._status_text = ""
 
         if mode == "paired":
@@ -133,6 +134,15 @@ class ApproachSession:
             from policy_net import load_policy
 
             self.policy = load_policy(policy_path)
+            # The first network call is slow. Do it before PX4 is armed, or it
+            # stalls the simulator and the arm command never arrives.
+            from policy_net import predict
+
+            predict(
+                self.policy,
+                np.zeros((OBS_HEIGHT, OBS_WIDTH), dtype=np.float32),
+                np.zeros(STATE_DIM, dtype=np.float32),
+            )
 
     def finished(self):
         return self.done
@@ -173,9 +183,6 @@ class ApproachSession:
 
         position = np.asarray(self.vehicle.state.position, dtype=np.float64)
         yaw = _yaw(self.vehicle.state.attitude)
-        expert_action = expert.command(position, yaw, self.pole_xy)
-        state = _body_state(self.vehicle.state)
-        action = self._select_action(expert_action, state, position, yaw)
 
         if self.phase == "stream":
             # The approach command starts only after takeoff. A policy command
@@ -187,6 +194,7 @@ class ApproachSession:
                 self._status_text = ""
                 self._set_offboard()
                 self._offboard_since = None
+                self._arm_noted = False
                 self.phase = "arm"
                 self.phase_started = now
             return
@@ -211,6 +219,12 @@ class ApproachSession:
                 return
             if self._offboard_since is None:
                 self._offboard_since = now
+            if not self._arm_noted:
+                self._arm_noted = True
+                print(
+                    f"Episode {self.episode + 1}: arm command to system "
+                    f"{self.master.target_system} component {self.master.target_component}"
+                )
             self._arm(force=now - self._offboard_since > 3.0)
             if self._armed():
                 self.takeoff_ned = None
@@ -253,6 +267,9 @@ class ApproachSession:
             return
 
         if self.phase == "fly":
+            expert_action = expert.command(position, yaw, self.pole_xy)
+            state = _body_state(self.vehicle.state)
+            action = self._select_action(expert_action, state, position, yaw)
             depth = _read_depth(self.camera_sensor)
             if self.mode != "paired" and not _pole_detected(position, yaw, self.pole_xy, depth):
                 action = _yaw_search(position, yaw, self.pole_xy)
@@ -776,8 +793,15 @@ class ApproachSession:
                 return
             kind = message.get_type()
             if kind == "HEARTBEAT":
+                # Other components on this port also send heartbeats, with no
+                # flight mode. Keeping the last one hides offboard and sends
+                # the arm command to a component PX4 ignores.
+                if int(message.get_srcComponent()) != mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1:
+                    continue
                 self._heartbeat = message
                 self._armed_state = bool(message.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                self.master.target_system = message.get_srcSystem()
+                self.master.target_component = message.get_srcComponent()
             elif kind == "STATUSTEXT":
                 text = message.text
                 if isinstance(text, bytes):
