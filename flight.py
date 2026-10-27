@@ -12,9 +12,10 @@ next pole is placed on a 3–5 m radius from that point, so a long run stays
 inside the geofence. Paired episodes keep the saved bearing.
 
 A timed-out or aborted episode descends in offboard and the next episode
-starts only after the vehicle is disarmed on the ground. Return-to-launch is
-not used: that mode climbs far above the room and the following episodes then
-time out while it is still active.
+starts only after the vehicle is disarmed on the ground. A failed arm leaves
+PX4 in position mode, so the next attempt is not stuck in an offboard
+failsafe. Return-to-launch is not used: that mode climbs far above the room
+and the following episodes then time out while it is still active.
 """
 
 import os
@@ -46,6 +47,8 @@ from task import (
 )
 
 OFFBOARD_MODE = 6
+# Position mode clears an offboard-loss failsafe left by a failed arm.
+POSCTL_MODE = 3
 # Ignore position, acceleration, and yaw. Use body velocity and yaw rate.
 VELOCITY_MASK = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10)
 # Ignore velocity, acceleration, yaw, and yaw rate. Use local position.
@@ -105,7 +108,10 @@ class ApproachSession:
         self.takeoff_ned = None
         self._last_fly_tick = None
         self._return_step = None
-        self._armed_state = True
+        self._armed_state = False
+        self._heartbeat = None
+        self._offboard_since = None
+        self._status_text = ""
 
         if mode == "paired":
             if starts is None or method not in ("policy", "modular"):
@@ -131,6 +137,8 @@ class ApproachSession:
         if self.done:
             return
         now = time.monotonic()
+        if self.master is not None:
+            self._note_status()
         if self.phase == "connect":
             self._connect()
             return
@@ -163,38 +171,60 @@ class ApproachSession:
 
         if self.phase == "stream":
             self._send(action)
+            if now - self.phase_started < 0.2:
+                self._set_position_mode()
             if now - self.phase_started > 1.0:
+                self._status_text = ""
                 self._set_offboard()
-                self._arm(force=False)
+                self._offboard_since = None
                 self.phase = "arm"
                 self.phase_started = now
             return
 
         if self.phase == "arm":
+            # The first boot rejects offboard until the position estimate
+            # exists. Arming before that leaves the vehicle in position mode,
+            # and the climb setpoints never leave the ground.
             self._send(action)
-            self._arm(force=now - self.phase_started > 3.0)
+            self._set_offboard()
+            if not self._offboard_active():
+                self._offboard_since = None
+                if now - self.phase_started > 40.0:
+                    detail = f": {self._status_text}" if self._status_text else ""
+                    print(f"Episode {self.episode + 1} did not enter offboard{detail}")
+                    self._set_position_mode()
+                    self._finish_episode(False, "no offboard")
+                elif now - self._status_time > 10.0:
+                    self._status_time = now
+                    detail = f" ({self._status_text})" if self._status_text else ""
+                    print(f"Episode {self.episode + 1}: waiting for offboard{detail}")
+                return
+            if self._offboard_since is None:
+                self._offboard_since = now
+            self._arm(force=now - self._offboard_since > 3.0)
             if self._armed():
-                self._set_offboard()
                 self.takeoff_ned = None
-                self.master.mav.request_data_stream_send(
-                    self.master.target_system,
-                    self.master.target_component,
-                    mavutil.mavlink.MAV_DATA_STREAM_POSITION,
-                    10,
-                    1,
-                )
+                self._request_position_stream()
                 self.phase = "takeoff"
                 self.phase_started = now
-            elif now - self.phase_started > 12.0:
-                print(f"Episode {self.episode + 1} did not arm")
+            elif now - self._offboard_since > 15.0:
+                detail = f": {self._status_text}" if self._status_text else ""
+                print(f"Episode {self.episode + 1} did not arm{detail}")
+                self._set_position_mode()
                 self._finish_episode(False, "no arm")
             return
 
         if self.phase == "takeoff":
             # A body-up velocity never settles: it is still climbing when the
             # height check becomes true. A position setpoint holds the approach altitude.
-            self._set_offboard()
+            if (
+                self.takeoff_ned is not None
+                and float(position[2]) < 0.4
+                and now - self.phase_started > 8.0
+            ):
+                self.takeoff_ned = None
             self._command_climb(position)
+            self._set_offboard()
             height_error = abs(float(position[2]) - TARGET_ALTITUDE_M)
             vertical_speed = abs(float(self.vehicle.state.linear_velocity[2]))
             if height_error < 0.3 and vertical_speed < 0.35:
@@ -278,6 +308,7 @@ class ApproachSession:
             self.master.target_system = message.get_srcSystem()
             self.master.target_component = message.get_srcComponent()
             print(f"PX4 connected, system {self.master.target_system}")
+            self._request_position_stream()
             # PX4 is still loading the airframe here. Repeat the battery writes
             # for a few seconds so the boot defaults do not replace them.
             self.phase = "configure"
@@ -446,31 +477,54 @@ class ApproachSession:
         horizontal = float(np.hypot(position[0], position[1]))
         if self._return_step == "stream":
             self._send(np.zeros(4, dtype=np.float32))
+            if now - self.phase_started < 0.2:
+                self._set_position_mode()
             if now - self.phase_started > 1.0:
+                self._status_text = ""
                 self._set_offboard()
-                self._arm(force=False)
+                self._offboard_since = None
                 self._return_step = "arm"
                 self.phase_started = now
             return
         if self._return_step == "arm":
             self._send(np.zeros(4, dtype=np.float32))
-            self._arm(force=now - self.phase_started > 3.0)
+            self._set_offboard()
+            if not self._offboard_active():
+                self._offboard_since = None
+                if now - self.phase_started > 40.0:
+                    detail = f": {self._status_text}" if self._status_text else ""
+                    print(
+                        f"Could not enter offboard for the return{detail}. Next pole is placed from "
+                        f"x={float(position[0]):.2f} y={float(position[1]):.2f}"
+                    )
+                    self._set_position_mode()
+                    self.phase = "between" if float(position[2]) <= 0.4 else "land"
+                    self.phase_started = now
+                return
+            if self._offboard_since is None:
+                self._offboard_since = now
+            self._arm(force=now - self._offboard_since > 3.0)
             if self._armed():
                 self._set_offboard()
                 self.takeoff_ned = None
                 self._return_step = "climb"
                 self.phase_started = now
-            elif now - self.phase_started > 12.0:
+            elif now - self._offboard_since > 15.0:
+                detail = f": {self._status_text}" if self._status_text else ""
                 print(
-                    f"Could not arm for the return. Next pole is placed from "
+                    f"Could not arm for the return{detail}. Next pole is placed from "
                     f"x={float(position[0]):.2f} y={float(position[1]):.2f}"
                 )
-                self.phase = "between"
+                self._set_position_mode()
+                if float(position[2]) > 0.4:
+                    self.phase = "land"
+                else:
+                    self.phase = "between"
                 self.phase_started = now
             return
         if self._return_step == "climb":
-            self._set_offboard()
             self._command_climb(position)
+            self._set_offboard()
             if abs(float(position[2]) - TARGET_ALTITUDE_M) < 0.4 or now - self.phase_started > 30.0:
                 self._return_step = "fly"
                 self.phase_started = now
@@ -618,20 +672,71 @@ class ApproachSession:
     def _descend_and_disarm(self, position, now):
         """True once the vehicle is disarmed on the ground.
 
-        Setpoints keep streaming, so a paused simulator is not followed by a
-        return-to-launch climb. The next episode is not started in the air.
+        A disarmed vehicle ignores setpoints, so an in-air disarm has to be
+        armed again before it can descend. On the ground, stay out of offboard:
+        that failsafe is what makes the next arm fail.
         """
         height = float(position[2])
+        if not self._armed():
+            if height < 0.4:
+                self._set_position_mode()
+                return True
+            self._send(np.array([0.0, 0.0, -0.4, 0.0], dtype=np.float32))
+            self._set_offboard()
+            self._arm(force=True, disarm=False)
+            self._report_still_landing(height, now)
+            return False
         downward = -0.4 if height > 0.35 else -0.15
         self._send(np.array([0.0, 0.0, downward, 0.0], dtype=np.float32))
         self._set_offboard()
         if height < 0.35:
             self._arm(force=True, disarm=True)
         landed = height < 0.25 and not self._armed()
-        if not landed and now - self.phase_started > 45.0 and now - self._status_time > 10.0:
-            self._status_time = now
-            print(f"Still landing from z={height:.2f}")
+        if not landed:
+            self._report_still_landing(height, now)
         return landed
+
+    def _report_still_landing(self, height, now):
+        if now - self.phase_started > 10.0 and now - self._status_time > 10.0:
+            self._status_time = now
+            detail = f" ({self._status_text})" if self._status_text else ""
+            print(f"Still landing from z={height:.2f}{detail}")
+
+    def _note_status(self):
+        while True:
+            message = self.master.recv_match(type="STATUSTEXT", blocking=False)
+            if message is None:
+                return
+            text = message.text
+            if isinstance(text, bytes):
+                text = text.decode("utf-8", errors="ignore")
+            text = str(text).replace("\x00", "").strip()
+            if text:
+                self._status_text = text
+
+    def _set_position_mode(self):
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+            0,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            POSCTL_MODE,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+
+    def _request_position_stream(self):
+        self.master.mav.request_data_stream_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_DATA_STREAM_POSITION,
+            10,
+            1,
+        )
 
     def _set_offboard(self):
         self.master.mav.command_long_send(
@@ -663,11 +768,22 @@ class ApproachSession:
             0,
         )
 
-    def _armed(self):
+    def _read_heartbeat(self):
         heartbeat = self.master.recv_match(type="HEARTBEAT", blocking=False)
         if heartbeat is not None:
+            self._heartbeat = heartbeat
             self._armed_state = bool(heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+        return self._heartbeat
+
+    def _armed(self):
+        self._read_heartbeat()
         return self._armed_state
+
+    def _offboard_active(self):
+        heartbeat = self._read_heartbeat()
+        if heartbeat is None:
+            return False
+        return ((int(heartbeat.custom_mode) >> 16) & 0xFF) == OFFBOARD_MODE
 
     def _disarm_and_stop(self):
         if self.master is not None:
