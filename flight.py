@@ -110,6 +110,7 @@ class ApproachSession:
         self._return_step = None
         self._armed_state = False
         self._heartbeat = None
+        self._local_position = None
         self._offboard_since = None
         self._status_text = ""
 
@@ -138,7 +139,7 @@ class ApproachSession:
             return
         now = time.monotonic()
         if self.master is not None:
-            self._note_status()
+            self._drain_mavlink()
         if self.phase == "connect":
             self._connect()
             return
@@ -303,7 +304,7 @@ class ApproachSession:
         if self.master is None:
             self.master = mavutil.mavlink_connection("udpin:0.0.0.0:14550", source_system=255)
             self.phase_started = now
-        message = self.master.recv_match(type="HEARTBEAT", blocking=False)
+        message = self._heartbeat
         if message is not None:
             self.master.target_system = message.get_srcSystem()
             self.master.target_component = message.get_srcComponent()
@@ -547,7 +548,7 @@ class ApproachSession:
 
     def _command_origin(self, position):
         """Position setpoint for Isaac (0, 0) at the approach altitude."""
-        local = self.master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
+        local = self._local_position
         if local is None:
             direction = -np.asarray(position[:2], dtype=np.float64)
             norm = float(np.linalg.norm(direction))
@@ -587,7 +588,7 @@ class ApproachSession:
 
     def _command_climb(self, position):
         if self.takeoff_ned is None:
-            local = self.master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
+            local = self._local_position
             if local is None:
                 climb = float(np.clip(0.5 * (TARGET_ALTITUDE_M - position[2]), -0.4, 0.4))
                 self._send(np.array([0.0, 0.0, climb, 0.0], dtype=np.float32))
@@ -702,17 +703,30 @@ class ApproachSession:
             detail = f" ({self._status_text})" if self._status_text else ""
             print(f"Still landing from z={height:.2f}{detail}")
 
-    def _note_status(self):
+    def _drain_mavlink(self):
+        """Read every queued PX4 message once.
+
+        recv_match(type=...) throws away messages of every other type.
+        Reading STATUSTEXT that way was discarding the heartbeat, so the
+        session never left "Waiting for PX4 heartbeat".
+        """
         while True:
-            message = self.master.recv_match(type="STATUSTEXT", blocking=False)
+            message = self.master.recv_msg()
             if message is None:
                 return
-            text = message.text
-            if isinstance(text, bytes):
-                text = text.decode("utf-8", errors="ignore")
-            text = str(text).replace("\x00", "").strip()
-            if text:
-                self._status_text = text
+            kind = message.get_type()
+            if kind == "HEARTBEAT":
+                self._heartbeat = message
+                self._armed_state = bool(message.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+            elif kind == "STATUSTEXT":
+                text = message.text
+                if isinstance(text, bytes):
+                    text = text.decode("utf-8", errors="ignore")
+                text = str(text).replace("\x00", "").strip()
+                if text:
+                    self._status_text = text
+            elif kind == "LOCAL_POSITION_NED":
+                self._local_position = message
 
     def _set_position_mode(self):
         self.master.mav.command_long_send(
@@ -769,10 +783,6 @@ class ApproachSession:
         )
 
     def _read_heartbeat(self):
-        heartbeat = self.master.recv_match(type="HEARTBEAT", blocking=False)
-        if heartbeat is not None:
-            self._heartbeat = heartbeat
-            self._armed_state = bool(heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
         return self._heartbeat
 
     def _armed(self):
