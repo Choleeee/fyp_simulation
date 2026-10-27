@@ -3,12 +3,14 @@
 The vehicle is commanded in PX4 offboard mode. It climbs at the start
 without recording, then the approach is recorded until the staging point,
 half a metre short of the pole. If the column is outside the camera, the
-vehicle yaws in place until the depth image shows it, then approaches. It
-lands on that spot. The next pole is placed 3–5 m from the landing on a new
-heading, at least 60 degrees off the direction to the pole just reached.
+vehicle yaws in place until the depth image shows it, then approaches. At
+the staging point it holds for 2 seconds, flies back to the origin, and
+lands there. It does not land on the staging point. The next pole is placed
+3–5 m from the origin on a new heading, at least 60 degrees off the
+direction to the pole just reached.
 
-After each landing the vehicle flies back to the origin and lands there. The
-next pole is placed on a 3–5 m radius from that point, so a long run stays
+A failed episode still lands where it is, then returns to the origin. The
+next pole is placed on a 3–5 m radius from that landing, so a long run stays
 inside the geofence. Paired episodes keep the saved bearing.
 
 A timed-out or aborted episode descends in offboard and the next episode
@@ -111,6 +113,7 @@ class ApproachSession:
         self._armed_state = False
         self._heartbeat = None
         self._local_position = None
+        self._hold_ned = None
         self._offboard_since = None
         self._status_text = ""
 
@@ -287,6 +290,13 @@ class ApproachSession:
                 self._finish_episode(False, "timeout")
             return
 
+        if self.phase == "pause":
+            self._hold_here()
+            self._set_offboard()
+            if now - self.phase_started >= 2.0:
+                self._start_return(position, now, airborne=True)
+            return
+
         if self.phase == "land":
             if self._descend_and_disarm(position, now):
                 self._start_return(position, now)
@@ -394,10 +404,15 @@ class ApproachSession:
     def _finish_episode(self, success, reason):
         self._save(success, reason)
         self.episode += 1
-        # The landing is not part of the demonstration. Stay in offboard and
-        # descend; the next episode waits until the vehicle is disarmed.
-        self.phase = "land"
         self.phase_started = time.monotonic()
+        self._hold_ned = None
+        if success:
+            # The hover and the return are not part of the demonstration.
+            print(f"Episode {self.episode}: holding at the target")
+            self.phase = "pause"
+            return
+        # A failure is not already at the staging hover. Land, then return.
+        self.phase = "land"
 
     def _save(self, success, reason):
         if self.mode == "paired":
@@ -459,19 +474,23 @@ class ApproachSession:
                 return index
         return self.episodes_requested
 
-    def _start_return(self, position, now):
-        if float(np.hypot(position[0], position[1])) <= 0.8:
+    def _start_return(self, position, now, airborne=False):
+        home = float(np.hypot(position[0], position[1])) <= 0.8
+        self.phase_started = now
+        self.last_command = now
+        self.takeoff_ned = None
+        if home and not airborne:
             self.phase = "between"
-            self.phase_started = now
+            return
+        self.phase = "return"
+        if home:
+            self._return_step = "land"
             return
         print(
             f"Returning to the origin from x={float(position[0]):.2f} y={float(position[1]):.2f}"
         )
-        self.phase = "return"
-        self._return_step = "stream"
-        self.takeoff_ned = None
-        self.phase_started = now
-        self.last_command = now
+        # Already at altitude and armed. Do not land and take off again.
+        self._return_step = "fly" if airborne else "stream"
 
     def _return_home(self, position, now):
         """Fly back to the origin and land. The estimator is not teleported."""
@@ -531,8 +550,8 @@ class ApproachSession:
                 self.phase_started = now
             return
         if self._return_step == "fly":
-            self._set_offboard()
             self._command_origin(position)
+            self._set_offboard()
             speed = float(np.linalg.norm(self.vehicle.state.linear_velocity))
             if (horizontal < 0.8 and speed < 0.4) or now - self.phase_started > 90.0:
                 if horizontal >= 0.8:
@@ -545,6 +564,34 @@ class ApproachSession:
         if self._descend_and_disarm(position, now):
             self.phase = "between"
             self.phase_started = now
+
+    def _hold_here(self):
+        """Position hold at the point where the staging hover began."""
+        if self._hold_ned is None:
+            local = self._local_position
+            if local is None:
+                self._send(np.zeros(4, dtype=np.float32))
+                return
+            self._hold_ned = (float(local.x), float(local.y), float(local.z))
+        north, east, down = self._hold_ned
+        self.master.mav.set_position_target_local_ned_send(
+            0,
+            self.master.target_system,
+            self.master.target_component,
+            LOCAL_NED,
+            POSITION_MASK,
+            north,
+            east,
+            down,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
 
     def _command_origin(self, position):
         """Position setpoint for Isaac (0, 0) at the approach altitude."""
