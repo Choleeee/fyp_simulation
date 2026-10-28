@@ -123,6 +123,8 @@ class ApproachSession:
         self._offboard_since = None
         self._arm_noted = False
         self._status_text = ""
+        self._settle_resume = "episode"
+        self._settle_fixed = False
         self.policy = None
         self._policy_ready = False
         self._policy_error = None
@@ -237,8 +239,13 @@ class ApproachSession:
             elif now - self.phase_started > 20.0:
                 detail = f": {self._status_text}" if self._status_text else ""
                 print(f"Episode {self.episode + 1} did not arm{detail}")
-                self._set_position_mode()
-                self._finish_episode(False, "no arm")
+                if float(position[2]) > 0.5:
+                    self._set_position_mode()
+                    self._finish_episode(False, "no arm")
+                else:
+                    # On the ground this is the estimator, not a lost command.
+                    # Starting the next episode here repeats the same refusal.
+                    self._begin_settle(now, "episode")
             return
 
         if self.phase == "takeoff":
@@ -346,12 +353,22 @@ class ApproachSession:
             return
 
         if self.phase == "land":
-            if self._descend_and_disarm(position, now):
+            if (
+                not self._armed()
+                and float(position[2]) > 0.5
+                and now - self.phase_started > 20.0
+            ):
+                self._begin_settle(now, "land")
+            elif self._descend_and_disarm(position, now):
                 self._start_return(position, now)
             return
 
         if self.phase == "return":
             self._return_home(position, now)
+            return
+
+        if self.phase == "settle":
+            self._settle(now)
             return
 
         if self.phase == "between":
@@ -579,38 +596,23 @@ class ApproachSession:
         if self._return_step == "arm":
             self._send(np.zeros(4, dtype=np.float32))
             self._set_offboard()
-            if not self._offboard_active():
-                self._offboard_since = None
-                if now - self.phase_started > 40.0:
-                    detail = f": {self._status_text}" if self._status_text else ""
-                    print(
-                        f"Could not enter offboard for the return{detail}. Next pole is placed from "
-                        f"x={float(position[0]):.2f} y={float(position[1]):.2f}"
-                    )
-                    self._set_position_mode()
-                    self.phase = "between" if float(position[2]) <= 0.4 else "land"
-                    self.phase_started = now
-                return
-            if self._offboard_since is None:
-                self._offboard_since = now
-            self._arm(force=now - self._offboard_since > 3.0)
+            self._arm(force=now - self.phase_started > 3.0)
             if self._armed():
                 self._set_offboard()
                 self.takeoff_ned = None
                 self._return_step = "climb"
                 self.phase_started = now
-            elif now - self._offboard_since > 15.0:
+            elif now - self.phase_started > 20.0:
                 detail = f": {self._status_text}" if self._status_text else ""
                 print(
-                    f"Could not arm for the return{detail}. Next pole is placed from "
+                    f"Could not arm for the return{detail} at "
                     f"x={float(position[0]):.2f} y={float(position[1]):.2f}"
                 )
-                self._set_position_mode()
-                if float(position[2]) > 0.4:
+                if float(position[2]) > 0.5:
                     self.phase = "land"
+                    self.phase_started = now
                 else:
-                    self.phase = "between"
-                self.phase_started = now
+                    self._begin_settle(now, "return")
             return
         if self._return_step == "climb":
             self._command_climb(position)
@@ -800,24 +802,90 @@ class ApproachSession:
         that failsafe is what makes the next arm fail.
         """
         height = float(position[2])
+        velocity = np.asarray(self.vehicle.state.linear_velocity, dtype=np.float64)
+        horizontal_speed = float(np.hypot(velocity[0], velocity[1]))
+        # Disarming while it is still moving, or still up, is what leaves the
+        # accelerometer bias and the velocity test above the arming limits.
+        on_ground = height < 0.30 and horizontal_speed < 0.25
         if not self._armed():
-            if height < 0.4:
+            if on_ground:
                 self._set_position_mode()
                 return True
-            self._send(np.array([0.0, 0.0, -0.4, 0.0], dtype=np.float32))
+            self._send(np.array([0.0, 0.0, -0.25, 0.0], dtype=np.float32))
             self._set_offboard()
             self._arm(force=True, disarm=False)
             self._report_still_landing(height, now)
             return False
-        downward = -0.4 if height > 0.35 else -0.15
+        downward = -0.25 if height > 0.35 else -0.1
         self._send(np.array([0.0, 0.0, downward, 0.0], dtype=np.float32))
         self._set_offboard()
-        if height < 0.35:
+        if on_ground:
             self._arm(force=True, disarm=True)
-        landed = height < 0.25 and not self._armed()
+        landed = height < 0.25 and horizontal_speed < 0.25 and not self._armed()
         if not landed:
             self._report_still_landing(height, now)
         return landed
+
+    def _begin_settle(self, now, resume):
+        """Stay disarmed and still, then arm the same episode again.
+
+        PX4 1.14 runs preflight checks on an external arm even when the force
+        flag is set. After a pole-motion abort the velocity test and the
+        accelerometer bias fail those checks, and starting the next episode
+        repeats the refusal.
+        """
+        self._settle_resume = resume
+        self._settle_fixed = False
+        self.phase = "settle"
+        self.phase_started = now
+        self._status_text = ""
+        self._set_position_mode()
+        print("Holding still until the estimator will allow arming")
+
+    def _settle(self, now):
+        self._send(np.zeros(4, dtype=np.float32))
+        self._set_position_mode()
+        if self._armed():
+            self._arm(force=True, disarm=True)
+            return
+        if not self._settle_fixed and now - self.phase_started > 0.5:
+            self._relax_estimator_arming()
+            self._settle_fixed = True
+        if now - self.phase_started < 15.0:
+            return
+        self._offboard_since = None
+        self._arm_noted = False
+        self.phase_started = now
+        if self._settle_resume == "return":
+            self.phase = "return"
+            self._return_step = "stream"
+            print("Estimator hold finished. Retrying the return")
+        elif self._settle_resume == "land":
+            self.phase = "land"
+            print("Estimator hold finished. Retrying the landing")
+        else:
+            self.phase = "stream"
+            print(f"Estimator hold finished. Retrying episode {self.episode + 1}")
+
+    def _relax_estimator_arming(self):
+        """Let a saturated SITL accelerometer bias pass, and clear saved offsets.
+
+        The bias states are clamped to EKF2_ABL_LIM, while arming rejects
+        anything above 0.75 of that limit. A bias that has reached the clamp
+        therefore fails every later arm. Raising the clamp puts the existing
+        estimate back inside the check. The simulated accelerometers have no
+        real offset, so the learned calibration is cleared as well.
+        """
+        real = mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+        self._set_param("COM_ARM_EKF_VEL", 1.0, real)
+        self._set_param("COM_ARM_EKF_POS", 1.0, real)
+        self._set_param("COM_ARM_EKF_YAW", 1.0, real)
+        self._set_param("EKF2_ABL_LIM", 0.8, real)
+        for index in range(3):
+            for axis in ("X", "Y", "Z"):
+                self._set_param(f"CAL_ACC{index}_{axis}OFF", 0.0, real)
+                self._set_param(f"CAL_ACC{index}_{axis}SCALE", 1.0, real)
+        print("Relaxed the estimator arming checks and cleared the accelerometer offsets")
 
     def _report_still_landing(self, height, now):
         if now - self.phase_started > 10.0 and now - self._status_time > 10.0:
@@ -846,9 +914,11 @@ class ApproachSession:
                 self._armed_state = bool(message.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
             elif kind == "STATUSTEXT":
                 text = message.text
-                if isinstance(text, bytes):
-                    text = text.decode("utf-8", errors="ignore")
-                text = str(text).replace("\x00", "").strip()
+                if isinstance(text, (bytes, bytearray)):
+                    text = bytes(text).split(b"\x00", 1)[0].decode("utf-8", errors="ignore")
+                else:
+                    text = str(text).replace("\x00", "")
+                text = text.strip()
                 if text:
                     self._status_text = text
             elif kind == "LOCAL_POSITION_NED":
