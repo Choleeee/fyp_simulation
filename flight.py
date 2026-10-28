@@ -2,15 +2,19 @@
 
 The vehicle is commanded in PX4 offboard mode. It climbs at the start
 without recording, then the approach is recorded until the staging point,
-half a metre short of the pole. If the column is outside the camera, the
-vehicle yaws in place until the depth image shows it, then approaches. At
-the staging point it holds for 2 seconds, flies back to the origin, and
-lands there. It does not land on the staging point. The next pole is placed
-3–5 m from the origin on a new heading, at least 60 degrees off the
-direction to the pole just reached.
+half a metre short of the pole. Collect and DAgger write a sample only
+while the pole centre is inside the camera, and the label is the expert
+command. A frame with the pole outside the camera is left out: the expert
+yaw then depends on a bearing the image does not show. Collect places the
+next pole 3–5 m straight ahead, the same geometry as the paired test.
+DAgger leaves the policy in control for the whole approach. Rollout still
+yaws toward the true bearing when the pole is outside the camera, and
+those files are not used for training. At the staging point the vehicle
+holds for 2 seconds, flies back to the origin, and lands there. It does
+not land on the staging point.
 
 A failed episode still lands where it is, then returns to the origin. The
-next pole is placed on a 3–5 m radius from that landing, so a long run stays
+next pole stays on a 3–5 m radius from that landing, so a long run stays
 inside the geofence. Paired episodes keep the saved bearing.
 
 A timed-out or aborted episode descends in offboard and the next episode
@@ -21,6 +25,7 @@ and the following episodes then time out while it is still active.
 """
 
 import os
+import threading
 import time
 
 import numpy as np
@@ -103,6 +108,7 @@ class ApproachSession:
         self.last_command = 0.0
         self.samples = []
         self.missed_frames = 0
+        self.out_of_view = 0
         self.searching = False
         self.supervisor = ApproachSupervisor()
         self.done = False
@@ -117,6 +123,9 @@ class ApproachSession:
         self._offboard_since = None
         self._arm_noted = False
         self._status_text = ""
+        self.policy = None
+        self._policy_ready = False
+        self._policy_error = None
 
         if mode == "paired":
             if starts is None or method not in ("policy", "modular"):
@@ -131,21 +140,29 @@ class ApproachSession:
         if mode in ("rollout", "dagger") or (mode == "paired" and method == "policy"):
             if not os.path.isfile(policy_path):
                 raise SystemExit(f"Missing {policy_path}. Run train_policy.py after collecting episodes.")
-            from policy_net import load_policy
-
-            self.policy = load_policy(policy_path)
-            # The first network call is slow. Do it before PX4 is armed, or it
-            # stalls the simulator and the arm command never arrives.
-            from policy_net import predict
-
-            predict(
-                self.policy,
-                np.zeros((OBS_HEIGHT, OBS_WIDTH), dtype=np.float32),
-                np.zeros(STATE_DIM, dtype=np.float32),
-            )
+            # PX4 is already running. Loading the network here would stop the
+            # simulator, and the arm command would not be received. Modular
+            # does not load a network, so it does not hit this.
+            threading.Thread(target=self._load_policy, daemon=True).start()
 
     def finished(self):
         return self.done
+
+    def _load_policy(self):
+        try:
+            from policy_net import load_policy, predict
+
+            policy = load_policy(self.policy_path)
+            predict(
+                policy,
+                np.zeros((OBS_HEIGHT, OBS_WIDTH), dtype=np.float32),
+                np.zeros(STATE_DIM, dtype=np.float32),
+            )
+            self.policy = policy
+            self._policy_ready = True
+            print("Policy loaded")
+        except Exception as exc:
+            self._policy_error = str(exc)
 
     def on_step(self):
         if self.done:
@@ -200,38 +217,24 @@ class ApproachSession:
             return
 
         if self.phase == "arm":
-            # The first boot rejects offboard until the position estimate
-            # exists. Arming before that leaves the vehicle in position mode,
-            # and the climb setpoints never leave the ground.
+            # Send the arm command on this phase. Waiting until the heartbeat
+            # shows offboard was skipping it, and PX4 then reported that no
+            # external arm command arrived.
             self._send(np.zeros(4, dtype=np.float32))
             self._set_offboard()
-            if not self._offboard_active():
-                self._offboard_since = None
-                if now - self.phase_started > 40.0:
-                    detail = f": {self._status_text}" if self._status_text else ""
-                    print(f"Episode {self.episode + 1} did not enter offboard{detail}")
-                    self._set_position_mode()
-                    self._finish_episode(False, "no offboard")
-                elif now - self._status_time > 10.0:
-                    self._status_time = now
-                    detail = f" ({self._status_text})" if self._status_text else ""
-                    print(f"Episode {self.episode + 1}: waiting for offboard{detail}")
-                return
-            if self._offboard_since is None:
-                self._offboard_since = now
             if not self._arm_noted:
                 self._arm_noted = True
                 print(
                     f"Episode {self.episode + 1}: arm command to system "
                     f"{self.master.target_system} component {self.master.target_component}"
                 )
-            self._arm(force=now - self._offboard_since > 3.0)
+            self._arm(force=now - self.phase_started > 3.0)
             if self._armed():
                 self.takeoff_ned = None
                 self._request_position_stream()
                 self.phase = "takeoff"
                 self.phase_started = now
-            elif now - self._offboard_since > 15.0:
+            elif now - self.phase_started > 20.0:
                 detail = f": {self._status_text}" if self._status_text else ""
                 print(f"Episode {self.episode + 1} did not arm{detail}")
                 self._set_position_mode()
@@ -267,11 +270,28 @@ class ApproachSession:
             return
 
         if self.phase == "fly":
+            needs_policy = self.mode in ("rollout", "dagger") or (
+                self.mode == "paired" and self.method == "policy"
+            )
+            if needs_policy and self.policy is None:
+                self._send(np.zeros(4, dtype=np.float32))
+                self._set_offboard()
+                if self._policy_error:
+                    print(f"Episode {self.episode + 1} could not load the policy: {self._policy_error}")
+                    self._finish_episode(False, "no policy")
+                elif now - self._status_time > 10.0:
+                    self._status_time = now
+                    print(f"Episode {self.episode + 1}: waiting for the policy")
+                return
             expert_action = expert.command(position, yaw, self.pole_xy)
             state = _body_state(self.vehicle.state)
             action = self._select_action(expert_action, state, position, yaw)
             depth = _read_depth(self.camera_sensor)
-            if self.mode != "paired" and not _pole_detected(position, yaw, self.pole_xy, depth):
+            # Collect and rollout yaw with the true bearing until the pole
+            # enters the camera. DAgger does not: the policy has to fly the
+            # approach it will fly in the paired test, and the expert label
+            # is taken on those images.
+            if self.mode in ("collect", "rollout") and not _pole_detected(position, yaw, self.pole_xy, depth):
                 action = _yaw_search(position, yaw, self.pole_xy)
                 if not self.searching:
                     self.searching = True
@@ -302,7 +322,12 @@ class ApproachSession:
             # failsafe it selected when the setpoint stream paused.
             self._send(action)
             self._set_offboard()
-            self._record(state, action, expert_action)
+            self._record(
+                state,
+                action,
+                expert_action,
+                _pole_in_image(position, yaw, self.pole_xy),
+            )
             speed = float(np.linalg.norm(self.vehicle.state.linear_velocity))
             elapsed = now - self.phase_started
             if expert.reached_staging(position, self.pole_xy, speed):
@@ -365,6 +390,7 @@ class ApproachSession:
             return
         self.samples = []
         self.missed_frames = 0
+        self.out_of_view = 0
         self.supervisor.reset()
         self.takeoff_ned = None
         self._last_fly_tick = None
@@ -393,7 +419,13 @@ class ApproachSession:
             return
         position = np.asarray(self.vehicle.state.position, dtype=np.float64)
         yaw = _yaw(self.vehicle.state.attitude)
-        self.pole_xy = _next_pole(position[:2], self.pole_xy, yaw, np.random.default_rng())
+        rng = np.random.default_rng()
+        if self.mode in ("collect", "dagger"):
+            # Straight ahead, 3–5 m. The paired comparison uses this geometry,
+            # so the saved approaches are the ones the policy is scored on.
+            self.pole_xy = random_pole(position[:2], yaw, rng)
+        else:
+            self.pole_xy = _next_pole(position[:2], self.pole_xy, yaw, rng)
         self.pole.set_world_pose(position=np.array([self.pole_xy[0], self.pole_xy[1], POLE_HEIGHT_M / 2.0]))
         self.phase = "recharge"
         self.phase_started = time.monotonic()
@@ -417,10 +449,15 @@ class ApproachSession:
 
         return predict(self.policy, downsample_depth(depth), state)
 
-    def _record(self, state, executed_action, expert_action):
+    def _record(self, state, executed_action, expert_action, in_view):
         depth = _read_depth(self.camera_sensor)
         if depth is None:
             self.missed_frames += 1
+            return
+        # Outside the camera the expert yaw is not a function of the image.
+        # Saving it teaches the network to yaw when the column is absent.
+        if self.mode in ("collect", "dagger") and not in_view:
+            self.out_of_view += 1
             return
         observation = downsample_depth(depth)
         if self.mode == "collect":
@@ -450,8 +487,9 @@ class ApproachSession:
             return
         if not self.samples:
             print(
-                f"Episode {self.episode + 1} recorded no camera frames ({reason}, "
-                f"{self.missed_frames} reads empty)"
+                f"Episode {self.episode + 1} recorded no in-view approach frames "
+                f"({reason}, {self.missed_frames} reads empty, "
+                f"{self.out_of_view} out of view)"
             )
             return
         os.makedirs(self.data_dir, exist_ok=True)
@@ -465,9 +503,11 @@ class ApproachSession:
             action=action.astype(np.float32),
             success=np.array([success]),
             reason=np.array(reason),
+            in_view_labels=np.array(1 if self.mode in ("collect", "dagger") else 0, dtype=np.uint8),
         )
         missed = f", camera missed {self.missed_frames} steps" if self.missed_frames else ""
-        print(f"Saved {len(self.samples)} samples to {path} ({reason}{missed})")
+        hidden = f", left out {self.out_of_view} out-of-view steps" if self.out_of_view else ""
+        print(f"Saved {len(self.samples)} samples to {path} ({reason}{missed}{hidden})")
 
     def _save_pair(self, success, reason):
         os.makedirs(self.data_dir, exist_ok=True)
@@ -597,6 +637,7 @@ class ApproachSession:
 
     def _hold_here(self):
         """Position hold at the point where the staging hover began."""
+        self._address_autopilot()
         if self._hold_ned is None:
             local = self._local_position
             if local is None:
@@ -625,6 +666,7 @@ class ApproachSession:
 
     def _command_origin(self, position):
         """Position setpoint for Isaac (0, 0) at the approach altitude."""
+        self._address_autopilot()
         local = self._local_position
         if local is None:
             direction = -np.asarray(position[:2], dtype=np.float64)
@@ -664,6 +706,7 @@ class ApproachSession:
         )
 
     def _command_climb(self, position):
+        self._address_autopilot()
         if self.takeoff_ned is None:
             local = self._local_position
             if local is None:
@@ -697,6 +740,7 @@ class ApproachSession:
         )
 
     def _send(self, flu_action):
+        self._address_autopilot()
         # PX4 body frame is forward-right-down, and its yaw rate is clockwise.
         forward, left, up, yaw_rate_ccw = [float(value) for value in flu_action]
         self.master.mav.set_position_target_local_ned_send(
@@ -719,6 +763,7 @@ class ApproachSession:
         )
 
     def _set_param(self, name, value, ptype):
+        self._address_autopilot()
         self.master.mav.param_set_send(
             self.master.target_system,
             self.master.target_component,
@@ -790,18 +835,15 @@ class ApproachSession:
         while True:
             message = self.master.recv_msg()
             if message is None:
-                return
+                break
             kind = message.get_type()
             if kind == "HEARTBEAT":
                 # Other components on this port also send heartbeats, with no
-                # flight mode. Keeping the last one hides offboard and sends
-                # the arm command to a component PX4 ignores.
+                # flight mode. Keeping the last one hides offboard.
                 if int(message.get_srcComponent()) != mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1:
                     continue
                 self._heartbeat = message
                 self._armed_state = bool(message.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-                self.master.target_system = message.get_srcSystem()
-                self.master.target_component = message.get_srcComponent()
             elif kind == "STATUSTEXT":
                 text = message.text
                 if isinstance(text, bytes):
@@ -811,8 +853,19 @@ class ApproachSession:
                     self._status_text = text
             elif kind == "LOCAL_POSITION_NED":
                 self._local_position = message
+        # recv_msg() retargets the link at every sender. Put it back on the
+        # autopilot or the arm command goes to the last component and PX4
+        # never sees it. Collect and modular both use this read.
+        self._address_autopilot()
+
+    def _address_autopilot(self):
+        if self.master is None or self._heartbeat is None:
+            return
+        self.master.target_system = self._heartbeat.get_srcSystem()
+        self.master.target_component = self._heartbeat.get_srcComponent()
 
     def _set_position_mode(self):
+        self._address_autopilot()
         self.master.mav.command_long_send(
             self.master.target_system,
             self.master.target_component,
@@ -828,6 +881,7 @@ class ApproachSession:
         )
 
     def _request_position_stream(self):
+        self._address_autopilot()
         self.master.mav.request_data_stream_send(
             self.master.target_system,
             self.master.target_component,
@@ -837,6 +891,7 @@ class ApproachSession:
         )
 
     def _set_offboard(self):
+        self._address_autopilot()
         self.master.mav.command_long_send(
             self.master.target_system,
             self.master.target_component,
@@ -852,6 +907,7 @@ class ApproachSession:
         )
 
     def _arm(self, force=False, disarm=False):
+        self._address_autopilot()
         self.master.mav.command_long_send(
             self.master.target_system,
             self.master.target_component,
@@ -888,6 +944,12 @@ class ApproachSession:
             from compare_paired import report
 
             report(self.data_dir)
+
+
+def _pole_in_image(position, yaw, pole_xy):
+    """True when the pole centre lies inside the camera's horizontal field of view."""
+    half_fov = np.radians(CAMERA_HFOV_DEG) / 2.0
+    return abs(_view_error(position, yaw, pole_xy)) <= half_fov
 
 
 def _view_error(position, yaw, pole_xy):
